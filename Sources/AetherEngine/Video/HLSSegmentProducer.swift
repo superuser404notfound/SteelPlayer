@@ -174,6 +174,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
     private var loggedFirstVideoPktInfo = false
+    /// Diagnostic counter for the first few video write_frame calls.
+    /// We log details of the first 6 writes so the dts sequence going
+    /// into the muxer is visible in the session log; the
+    /// "Application provided invalid, non monotonically increasing
+    /// dts to muxer in stream 0" warning fires every session start
+    /// and we want to see exactly what the producer is handing the
+    /// muxer when that fires.
+    private var videoWriteCallCount: Int = 0
 
     /// Scan-forward + dynamic-shift state. The static `restart*Target`
     /// fields are seeded from `plan[baseIndex]` for restart sessions
@@ -995,7 +1003,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
         }
 
+        let sourceDtsBefore = packet.pointee.dts
+        let sourcePtsBefore = packet.pointee.pts
+        let sourceDurBefore = packet.pointee.duration
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxerVideoTimeBase)
+        if videoWriteCallCount < 6 {
+            EngineLog.emit(
+                "[HLSSegmentProducer] write_frame video #\(videoWriteCallCount + 1): "
+                + "srcDts=\(sourceDtsBefore) srcPts=\(sourcePtsBefore) srcDur=\(sourceDurBefore) "
+                + "→ muxerDts=\(packet.pointee.dts) muxerPts=\(packet.pointee.pts) muxerDur=\(packet.pointee.duration) "
+                + "(srcTb=\(sourceVideoTimeBase.num)/\(sourceVideoTimeBase.den) "
+                + "muxerTb=\(muxerVideoTimeBase.num)/\(muxerVideoTimeBase.den)) "
+                + "flags=0x\(String(packet.pointee.flags, radix: 16))",
+                category: .session
+            )
+        }
+        videoWriteCallCount += 1
         _ = av_write_frame(ctx, packet)
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
@@ -1086,7 +1109,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         if url == "init.mp4" {
             EngineLog.emit(
-                "[HLSSegmentProducer] init.mp4 captured (\(data.count) B)",
+                "[HLSSegmentProducer] init.mp4 captured (\(data.count) B) first256hex=\(Self.hexPreview(data, limit: 256))",
                 category: .session
             )
             cache.setInit(data)
@@ -1119,7 +1142,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 if checkShouldStop() { return }
 
                 EngineLog.emit(
-                    "[HLSSegmentProducer] seg-\(absIdx).m4s captured (\(data.count) B)",
+                    "[HLSSegmentProducer] seg-\(absIdx).m4s captured (\(data.count) B)\(absIdx == baseIndex ? " first128hex=\(Self.hexPreview(data, limit: 128))" : "")",
                     category: .session
                 )
                 cache.store(index: absIdx, data: data)
@@ -1146,6 +1169,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Hex preview of the first `limit` bytes of a Data, separated by
+    /// spaces every 4 bytes for readability. Used for fragment-
+    /// diagnostic logging so init.mp4 / seg-0.m4s structure is visible
+    /// in the session log without needing mp4dump access to the
+    /// device.
+    private static func hexPreview(_ data: Data, limit: Int) -> String {
+        let n = min(data.count, limit)
+        var out = ""
+        out.reserveCapacity(n * 3)
+        for i in 0..<n {
+            if i > 0 && i % 4 == 0 { out += " " }
+            out += String(format: "%02x", data[i])
+        }
+        return out
+    }
 
     /// Equivalent of FFmpeg's `MKTAG(a, b, c, d)`. Encodes a four-character
     /// code as a little-endian `UInt32` (byte 0 = a, byte 3 = d).

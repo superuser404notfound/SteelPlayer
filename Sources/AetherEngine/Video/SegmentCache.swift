@@ -164,6 +164,48 @@ final class SegmentCache {
         condition.broadcast()
     }
 
+    /// Adopt a fully-written staging file as the cache entry for
+    /// `index` via `rename(2)`. The producer streams libavformat's
+    /// muxer output straight to disk under our `sessionDir`, then
+    /// calls this method at sink-close time. Rename keeps the bytes
+    /// kernel-side: the page cache pages used while writing are
+    /// preserved (warmed-up pages for the segment we're about to
+    /// serve), and the rename itself is metadata-only. Compared to
+    /// `store(index:data:)`, this skips a Swift Data round trip and
+    /// keeps the segment out of our heap entirely.
+    func adopt(index: Int, stagingPath: URL, byteCount: Int) {
+        let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
+        let renameOK: Bool
+        do {
+            // .replacing handles the rare same-index re-adopt
+            // (producer restart over an existing entry) by clobbering
+            // the previous file. Same-volume because both paths live
+            // under sessionDir, so this is a metadata-only rename.
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+            try FileManager.default.moveItem(at: stagingPath, to: fileURL)
+            renameOK = true
+        } catch {
+            EngineLog.emit("[SegmentCache] adopt failed seg-\(index): \(error)",
+                           category: .session)
+            try? FileManager.default.removeItem(at: stagingPath)
+            renameOK = false
+        }
+
+        condition.lock()
+        defer { condition.unlock() }
+        if renameOK {
+            if let old = entries[index] {
+                _totalBytes -= byteSize(of: old)
+            }
+            entries[index] = fileURL
+            _totalBytes += byteCount
+        }
+        pruneOutsideWindow()
+        condition.broadcast()
+    }
+
     func close() {
         condition.lock()
         closed = true

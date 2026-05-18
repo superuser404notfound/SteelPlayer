@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Libavformat
 import Libavcodec
@@ -1130,10 +1131,38 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - IO trampoline plumbing (called from the C callbacks below)
 
     fileprivate func openSink(url: String) -> UnsafeMutablePointer<AVIOContext>? {
-        let sink = SegmentSink(url: url)
+        // Stage every segment as a real file under the cache's session
+        // directory so the cache's adopt step is a same-volume rename
+        // rather than a cross-volume copy. The filename includes a UUID
+        // suffix so concurrent producer restarts (rare but possible
+        // during fast scrub sequences) don't collide on the same path.
+        let staging = cache.sessionDir.appendingPathComponent(
+            "staging-\(url)-\(UUID().uuidString.prefix(8)).tmp"
+        )
+        let cPath = staging.withUnsafeFileSystemRepresentation { ptr -> [CChar] in
+            guard let p = ptr else { return [] }
+            var arr = [CChar]()
+            var i = 0
+            while p[i] != 0 { arr.append(p[i]); i += 1 }
+            arr.append(0)
+            return arr
+        }
+        guard !cPath.isEmpty else { return nil }
+        let fd = cPath.withUnsafeBufferPointer { buf -> Int32 in
+            // O_WRONLY | O_CREAT | O_TRUNC, mode 0644. Fail loud if
+            // creation fails so the muxer surfaces -ENOMEM-style errors
+            // back to its caller; better than silently routing into a
+            // black-hole sink.
+            return open(buf.baseAddress, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        }
+        guard fd >= 0 else { return nil }
+
+        let sink = SegmentSink(url: url, path: staging, fd: fd)
         let opaque = Unmanaged.passRetained(sink).toOpaque()
         let bufSize: Int32 = 65536
         guard let raw = av_malloc(Int(bufSize)) else {
+            close(fd)
+            try? FileManager.default.removeItem(at: staging)
             Unmanaged<SegmentSink>.fromOpaque(opaque).release()
             return nil
         }
@@ -1148,6 +1177,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             nil
         ) else {
             av_free(raw)
+            close(fd)
+            try? FileManager.default.removeItem(at: staging)
             Unmanaged<SegmentSink>.fromOpaque(opaque).release()
             return nil
         }
@@ -1158,12 +1189,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
     fileprivate func closeSink(pb: UnsafeMutablePointer<AVIOContext>) {
         avio_flush(pb)
         let opaqueRaw = pb.pointee.opaque
-        var data = Data()
         var url = ""
+        var path: URL? = nil
+        var byteCount = 0
+        var writeFailed = false
         if let opaque = opaqueRaw {
             let sink = Unmanaged<SegmentSink>.fromOpaque(opaque).takeRetainedValue()
-            data = sink.buffer
+            // Close the fd before dispatch so the rename / mmap path
+            // doesn't race the kernel still flushing pending writes
+            // from the page cache. fsync would be overkill (we're
+            // about to read the file right back via mmap in the
+            // same process), so a plain close is fine.
+            close(sink.fd)
             url = sink.url
+            path = sink.path
+            byteCount = sink.bytesWritten
+            writeFailed = sink.writeFailed
         }
         // Free the buffer libavformat currently has on the context. It
         // may have been reallocated since openSink (avio grows it on
@@ -1178,17 +1219,46 @@ final class HLSSegmentProducer: @unchecked Sendable {
         var pbVar: UnsafeMutablePointer<AVIOContext>? = pb
         avio_context_free(&pbVar)
 
-        dispatchSinkOutput(url: url, data: data)
+        if let path = path {
+            dispatchSinkOutput(url: url, stagingPath: path,
+                               byteCount: byteCount, writeFailed: writeFailed)
+        }
     }
 
-    private func dispatchSinkOutput(url: String, data: Data) {
+    private func dispatchSinkOutput(url: String, stagingPath: URL,
+                                    byteCount: Int, writeFailed: Bool) {
+        // Helper: peek the first `limit` bytes of the staging file
+        // via mmap so the diagnostic hex preview still works without
+        // ever materialising the segment into the Swift heap. mmap
+        // is unmapped when the local Data falls out of scope.
+        func hexPreviewFromFile(at path: URL, limit: Int) -> String {
+            guard let data = try? Data(contentsOf: path,
+                                       options: [.alwaysMapped, .uncached]) else {
+                return ""
+            }
+            return Self.hexPreview(data, limit: limit)
+        }
 
-        if url == "init.mp4" {
+        if writeFailed {
             EngineLog.emit(
-                "[HLSSegmentProducer] init.mp4 captured (\(data.count) B) first256hex=\(Self.hexPreview(data, limit: 256))",
+                "[HLSSegmentProducer] sink write failed for \(url); discarding staging file",
                 category: .session
             )
-            cache.setInit(data)
+            try? FileManager.default.removeItem(at: stagingPath)
+            return
+        }
+
+        if url == "init.mp4" {
+            // init.mp4 is small (~3.5 KB) and the cache wants it in
+            // RAM (it's pinned and served on every session). Read it
+            // back once via mmap-then-copy and hand to cache.setInit.
+            let initBytes = (try? Data(contentsOf: stagingPath)) ?? Data()
+            EngineLog.emit(
+                "[HLSSegmentProducer] init.mp4 captured (\(byteCount) B) first256hex=\(hexPreviewFromFile(at: stagingPath, limit: 256))",
+                category: .session
+            )
+            cache.setInit(initBytes)
+            try? FileManager.default.removeItem(at: stagingPath)
             return
         }
         // "seg-N.m4s" — N is the hlsenc sequence number, which equals
@@ -1198,9 +1268,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if url.hasPrefix("seg-"), url.hasSuffix(".m4s") {
             let inner = url.dropFirst("seg-".count).dropLast(".m4s".count)
             if let absIdx = Int(inner) {
-                // Backpressure FIRST, store SECOND. Doing the store
+                // Backpressure FIRST, adopt SECOND. Doing the adopt
                 // before the wait lets `pruneOutsideWindow` evict the
-                // just-written segment whenever the cache window
+                // just-staged segment whenever the cache window
                 // hasn't slid to include `absIdx` yet (race window:
                 // AVPlayer fetch latency greater than muxer cut
                 // interval, e.g. H.264 with ~2-3 MB segments on a
@@ -1215,19 +1285,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 while !checkShouldStop() {
                     if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) { break }
                 }
-                if checkShouldStop() { return }
+                if checkShouldStop() {
+                    try? FileManager.default.removeItem(at: stagingPath)
+                    return
+                }
 
+                let preview = (absIdx == baseIndex)
+                    ? " first128hex=\(hexPreviewFromFile(at: stagingPath, limit: 128))"
+                    : ""
                 EngineLog.emit(
-                    "[HLSSegmentProducer] seg-\(absIdx).m4s captured (\(data.count) B)\(absIdx == baseIndex ? " first128hex=\(Self.hexPreview(data, limit: 128))" : "")",
+                    "[HLSSegmentProducer] seg-\(absIdx).m4s captured (\(byteCount) B)\(preview)",
                     category: .session
                 )
-                cache.store(index: absIdx, data: data)
+                cache.adopt(index: absIdx, stagingPath: stagingPath,
+                            byteCount: byteCount)
                 return
             }
         }
         // playlist.m3u8 (or any other path) — we generate our own
         // playlist from the pre-planned keyframe segment list, so any
         // bytes hlsenc writes here are discarded.
+        try? FileManager.default.removeItem(at: stagingPath)
     }
 
     // MARK: - Cleanup
@@ -1278,18 +1356,54 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
 // MARK: - Sink storage
 
+/// Per-segment sink that streams libavformat's muxer output straight
+/// to a disk file via a POSIX file descriptor. The previous
+/// implementation accumulated bytes into a `var buffer = Data()` and
+/// drained the whole Data into `cache.store(data:)` at close. That
+/// pattern fragmented the Swift heap badly on 4K HDR HEVC: each ~10
+/// MB segment hit ~150 `Data.append(buf, count:)` calls with libavformat's
+/// 64 KB writes, geometric-growth reallocation walked the buffer up
+/// through every power-of-two size, and even after release the malloc
+/// allocator held the freed pages in its arena. Across many in-flight
+/// segments the resident set climbed ~3 MB/sec proportional to source
+/// bitrate.
+///
+/// POSIX `write(2)` straight into a real file moves the bytes
+/// kernel-side with no Swift heap residency at all. The cache adopts
+/// the finished file via `rename(2)` instead of copying through a
+/// Data round trip.
 private final class SegmentSink {
+    /// libavformat-side URL ("init.mp4", "seg-0.m4s", ...) for the
+    /// dispatch path's branching.
     let url: String
-    var buffer = Data()
-    init(url: String) { self.url = url }
+    /// Disk path the file descriptor points at. Lives under the
+    /// cache's session dir so the cache's `rename` move stays on the
+    /// same volume.
+    let path: URL
+    /// Open file descriptor for the staging file. Closed in closeSink.
+    let fd: Int32
+    /// Total bytes successfully written so we can log the segment
+    /// size at close without `stat`ing the file.
+    var bytesWritten: Int = 0
+    /// Sticky once any `write(2)` call short-returns or errors. The
+    /// dispatch path checks this so partial files don't reach the
+    /// cache.
+    var writeFailed: Bool = false
+
+    init(url: String, path: URL, fd: Int32) {
+        self.url = url
+        self.path = path
+        self.fd = fd
+    }
 }
 
 // MARK: - C callback bridges
 
 /// `s->io_open` trampoline. Routed back into the `HLSSegmentProducer`
 /// via the `s->opaque` pointer set at construction. Returns a custom
-/// `AVIOContext` whose write callback appends to a per-sink `Data`
-/// buffer; the closeSink path drains that buffer into the `SegmentCache`.
+/// `AVIOContext` whose write callback streams bytes straight into a
+/// per-sink disk file; the closeSink path renames that file into the
+/// `SegmentCache`'s entries map.
 private func hlsProducerIOOpen(
     s: UnsafeMutablePointer<AVFormatContext>?,
     pb: UnsafeMutablePointer<UnsafeMutablePointer<AVIOContext>?>?,
@@ -1307,8 +1421,8 @@ private func hlsProducerIOOpen(
     return 0
 }
 
-/// `s->io_close2` trampoline. Drains the sink's accumulated buffer
-/// into the producer's dispatch path and frees the `AVIOContext`.
+/// `s->io_close2` trampoline. Closes the sink's fd, renames the
+/// staging file into the cache, and frees the `AVIOContext`.
 private func hlsProducerIOClose2(
     s: UnsafeMutablePointer<AVFormatContext>?,
     pb: UnsafeMutablePointer<AVIOContext>?
@@ -1320,7 +1434,10 @@ private func hlsProducerIOClose2(
 }
 
 /// `avio_alloc_context` write callback. `opaque` is the retained
-/// `SegmentSink` pointer set in `openSink`.
+/// `SegmentSink` pointer set in `openSink`. Writes the buffer
+/// straight to the sink's fd via POSIX `write(2)`, looping on
+/// short writes and EINTR. Returns `size` on full success, the
+/// raw `write` return on error so libavformat surfaces the failure.
 private func hlsProducerSinkWrite(
     opaque: UnsafeMutableRawPointer?,
     buf: UnsafePointer<UInt8>?,
@@ -1328,6 +1445,23 @@ private func hlsProducerSinkWrite(
 ) -> Int32 {
     guard let opaque = opaque, let buf = buf, size > 0 else { return -1 }
     let sink = Unmanaged<SegmentSink>.fromOpaque(opaque).takeUnretainedValue()
-    sink.buffer.append(buf, count: Int(size))
+    if sink.writeFailed { return -1 }
+    var written = 0
+    let total = Int(size)
+    while written < total {
+        let n = write(sink.fd, buf.advanced(by: written), total - written)
+        if n < 0 {
+            let err = errno
+            if err == EINTR { continue }
+            sink.writeFailed = true
+            return -1
+        }
+        if n == 0 {
+            sink.writeFailed = true
+            return -1
+        }
+        written += n
+    }
+    sink.bytesWritten += total
     return size
 }

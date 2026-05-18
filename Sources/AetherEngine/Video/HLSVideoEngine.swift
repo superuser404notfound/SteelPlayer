@@ -1786,31 +1786,24 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         return bytes
     }
 
-    var segmentCount: Int {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return visibleHighWater + 1
-    }
+    var segmentCount: Int { segments.count }
 
     func segmentDuration(at index: Int) -> Double {
         guard index >= 0, index < segments.count else { return 0 }
         return segments[index].durationSeconds
     }
 
-    /// Sliding-window playlist: EVENT until the visible window reaches
-    /// the last source segment, then transitions to VOD (with ENDLIST)
-    /// for clean end-of-stream detection. AVPlayer caches EVENT
-    /// playlists conservatively (no arbitrary backward-seek
-    /// prefetch) which is the bounded-memory path; VOD caches
-    /// everything. Holding off ENDLIST for the whole session keeps the
-    /// session in the bounded-memory regime; the brief VOD-mode tail
-    /// after the playlist fully populates is short enough that it
-    /// can't OOM before the user reaches the end of content.
-    var playlistType: HLSPlaylistType {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return endlistAdded ? .vod : .event
-    }
+    /// Reverted to .vod after the sliding-window EVENT experiment:
+    /// EVENT halved RSS growth (3.0 → 1.3 MB/sec) but did not bound
+    /// it (AVPlayer still retains ~93% of consumed source bytes
+    /// regardless of playlist type), and the side effects were
+    /// unacceptable — Control Center showed "LIVE" instead of a
+    /// scrub bar (caused by EVENT making asset.duration NaN), and
+    /// replay-from-beginning landed ~2 min in (AVPlayer's EVENT
+    /// live-edge default overrode EXT-X-START even with the
+    /// explicit seek-to-0). The leak is fundamental to the
+    /// AVPlayer + HLS-loopback pipeline for 4K HDR HEVC content.
+    var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {

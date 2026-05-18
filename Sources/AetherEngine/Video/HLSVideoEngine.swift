@@ -677,16 +677,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let hdcpLevel: String? = (dvVariant != .none) ? "TYPE-1" : nil
 
         // Latch the DV RPU strip decision before the producer is built.
-        // DV source + non-DV routing (auto-tonemap path) = strip; the
-        // RPU NALs would otherwise sit in every video packet for the
-        // entire session and AVPlayer's HEVC parser would still scan
-        // them per frame even though no display target consumes them.
-        // For DV source + DV mode (master playlist + effective DV
-        // engaged) the RPUs are needed and we must NOT strip.
-        self.producerStripDVRPU = (dvVariant != .none) && !effectiveDvMode
+        // We CAN'T derive this from `dvVariant` because the routing
+        // code forces `dvVariant = .none` in the `!effectiveDvMode`
+        // downgrade branch even when the source carries DV — that's
+        // intentional so downstream routing treats the asset as plain
+        // HEVC, but it means the source's actual DV state is lost by
+        // the time we get here. Re-probe `doviConfigRecord` directly
+        // (HEVC only — H.264 and AV1 don't use type-62 NALs and the
+        // strip filter parses HEVC NAL framing). Strip engages iff
+        // the SOURCE has DV AND we're routing to non-DV playback;
+        // for the DV-mode path the RPUs are needed for dynamic tone-
+        // mapping and must NOT be stripped.
+        let sourceHasDVRecord: Bool = {
+            guard !isH264, !isAV1 else { return false }
+            return doviConfigRecord(from: codecpar) != nil
+        }()
+        self.producerStripDVRPU = sourceHasDVRecord && !effectiveDvMode
         if self.producerStripDVRPU {
             EngineLog.emit(
-                "[HLSVideoEngine] DV RPU strip ON (source=\(dvVariant), effectiveDvMode=false)",
+                "[HLSVideoEngine] DV RPU strip ON (sourceHasDV=true, "
+                + "effectiveDvMode=false, routing=plain HEVC)",
                 category: .session
             )
         }

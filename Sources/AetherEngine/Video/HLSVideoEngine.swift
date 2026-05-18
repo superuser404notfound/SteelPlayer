@@ -218,17 +218,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     private var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
-    /// True when the source carries Dolby Vision (dvVariant != .none)
-    /// AND the engine is downgrading playback to plain HEVC because
-    /// `effectiveDvMode == false` (no DV display, or Match Content
-    /// disabled). In this state the muxer must strip type-62 NAL units
-    /// from every video packet before write_frame so AVPlayer's HEVC
-    /// parser never sees DV RPUs that it can't drive a display target
-    /// with. The flag is latched during `start()` so producer restarts
-    /// (backward / forward scrub) keep the same behaviour without
-    /// re-computing the routing decision.
-    private var producerStripDVRPU: Bool = false
-
     /// Per-frame fallback durations (in the respective source
     /// time_base) so the producer can backfill `pkt->duration` when
     /// the matroska demuxer doesn't supply per-block durations.
@@ -676,34 +665,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             : nil
         let hdcpLevel: String? = (dvVariant != .none) ? "TYPE-1" : nil
 
-        // Latch the DV RPU strip decision before the producer is built.
-        // We CAN'T derive this from `dvVariant` because the routing
-        // forces it to `.none` in the `!effectiveDvMode` downgrade
-        // branch even when the source carries DV. Re-probe the codec
-        // parameters directly (HEVC only — H.264 / AV1 don't use
-        // type-62 NALs). Strip engages iff source has DV AND we're
-        // routing to non-DV playback; for the DV-mode path the RPUs
-        // are needed for dynamic tone-mapping.
-        //
-        // Strip implementation now goes through FFmpeg's `filter_units`
-        // bitstream filter (HLSSegmentProducer.init), which handles
-        // both Annex-B and length-prefix NAL framing natively. The
-        // hand-rolled parser this replaced broke on Annex-B sources
-        // by misreading start-codes as NAL lengths and mangling the
-        // bitstream.
-        let sourceHasDVRecord: Bool = {
-            guard !isH264, !isAV1 else { return false }
-            return doviConfigRecord(from: codecpar) != nil
-        }()
-        self.producerStripDVRPU = sourceHasDVRecord && !effectiveDvMode
-        if self.producerStripDVRPU {
-            EngineLog.emit(
-                "[HLSVideoEngine] DV RPU strip ON via filter_units BSF "
-                + "(sourceHasDV=true, effectiveDvMode=false, routing=plain HEVC)",
-                category: .session
-            )
-        }
-
         // 5. Position the demuxer at the file's first packet so the
         //    producer's pump starts from byte zero. The cue prewarm
         //    above moved the cursor mid-file; libavformat's index is
@@ -1008,7 +969,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         savedVideoConfig = nil
         savedAudioConfig = nil
         audioBridge = nil
-        producerStripDVRPU = false
         segmentPlan = []
         demuxer?.close()
         demuxer = nil
@@ -1089,8 +1049,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoDts: videoTarget,
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
-            desiredFirstAudioTfdtPts: desiredAudioTfdt,
-            stripDVRPU: producerStripDVRPU
+            desiredFirstAudioTfdtPts: desiredAudioTfdt
         )
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()

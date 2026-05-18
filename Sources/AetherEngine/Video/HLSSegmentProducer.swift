@@ -3,14 +3,6 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// FFmpeg `AVERROR(EAGAIN)`. POSIX EAGAIN is 35 on Apple platforms,
-/// and FFmpeg's `AVERROR(e)` macro is just `-(e)`. Surfaces from BSF
-/// receive calls when the filter needs more input before it can
-/// produce output — for `filter_units` this shouldn't happen in
-/// practice (1-in-1-out, synchronous) but we still treat it as
-/// non-fatal.
-private let AVERROR_EAGAIN_VALUE: Int32 = -35
-
 /// Drives libavformat's `hls` muxer for the duration of one playback
 /// session. Replaces the previous self-built `FMP4VideoMuxer` + lazy
 /// per-segment-fragment generator pair with a single long-lived
@@ -182,21 +174,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
     private var loggedFirstVideoPktInfo = false
-    /// One-shot log latch for the DV RPU strip: the first packet where
-    /// the BSF actually removes bytes emits a single log line so we can
-    /// confirm the filter engaged. Subsequent strips are silent to keep
-    /// the log readable.
-    private var loggedFirstRPUStrip = false
-
-    /// FFmpeg `filter_units` bitstream filter, configured with
-    /// `remove_types=62` to drop Dolby Vision RPU NALs. Allocated in
-    /// `init` when `stripDVRPU` is true AND the BSF is registered in
-    /// this FFmpeg build. Nil otherwise (no strip happens, the call
-    /// is bypassed). Replaces the hand-rolled `stripDVRPUFromHEVCPacket`
-    /// which broke on Annex-B-framed packets — `filter_units` handles
-    /// both Annex B and length-prefix natively because it's part of
-    /// libavcodec's reference NAL machinery.
-    private var dvRpuFilter: UnsafeMutablePointer<AVBSFContext>?
 
     /// Scan-forward + dynamic-shift state. The static `restart*Target`
     /// fields are seeded from `plan[baseIndex]` for restart sessions
@@ -346,23 +323,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// reason to keep paying for it after detection.
     private var hdr10PlusDetected = false
 
-    /// When true, the pump scans every video packet's HEVC bitstream
-    /// and removes any NAL units with `nal_unit_type == 62`
-    /// (NAL_UNSPEC62), which is the type Dolby Vision RPU metadata
-    /// rides under for HEVC sources. Enabled by the engine for the
-    /// media-playlist routing path where AVPlayer is treating the
-    /// asset as plain HDR10 HEVC (sample-entry `hvc1`, dvVariant
-    /// `.none`); the RPUs would otherwise sit in the bitstream and
-    /// be parsed by AVPlayer's HEVC NAL scanner per frame even though
-    /// no display target consumes them. Disabled for the master-
-    /// playlist + DV-mode path where AVPlayer needs the RPUs to drive
-    /// dynamic tone-mapping.
-    ///
-    /// The strip is a no-op on non-DV HEVC sources (no type-62 NALs
-    /// exist), and trivial on H.264 / AV1 (parser exits the scan
-    /// loop on the first NAL header that doesn't fit the HEVC layout).
-    private let stripDVRPU: Bool
-
     // MARK: - Init
 
     init(
@@ -377,15 +337,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioFallbackDurationPts: Int64 = 0,
         restartTargetVideoDts: Int64 = Int64.min,
         desiredFirstVideoTfdtPts: Int64,
-        desiredFirstAudioTfdtPts: Int64 = 0,
-        stripDVRPU: Bool = false
+        desiredFirstAudioTfdtPts: Int64 = 0
     ) throws {
         self.demuxer = demuxer
         self.videoStreamIndex = videoStreamIndex
         self.audioConfig = audio
         self.cache = cache
         self.baseIndex = baseIndex
-        self.stripDVRPU = stripDVRPU
         self.sourceVideoTimeBase = video.timeBase
         self.videoFallbackDurationPts = videoFallbackDurationPts
         self.audioFallbackDurationPts = audioFallbackDurationPts
@@ -447,56 +405,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if let override = video.codecTagOverride,
            let tag = Self.mkTag(fromFourCC: override) {
             videoStream.pointee.codecpar.pointee.codec_tag = tag
-        }
-
-        // 4a. Wire up the DV RPU strip BSF if requested. `filter_units`
-        //     is FFmpeg's reference NAL-filter; we configure it with
-        //     `remove_types=62` so every output packet has its DV RPU
-        //     NAL units stripped. Skipping init on a build that didn't
-        //     compile-in the BSF is silent — strip just won't run and
-        //     the rest of the producer still functions. Codec
-        //     parameters are copied from the source so the BSF knows
-        //     hvcC etc; time_base_in matches the muxer's source TB.
-        if stripDVRPU {
-            if let filter = av_bsf_get_by_name("filter_units") {
-                var bsfPtr: UnsafeMutablePointer<AVBSFContext>?
-                let allocRet = av_bsf_alloc(filter, &bsfPtr)
-                if allocRet >= 0, let bsf = bsfPtr {
-                    let parCopy = avcodec_parameters_copy(bsf.pointee.par_in, video.codecpar)
-                    bsf.pointee.time_base_in = video.timeBase
-                    _ = "remove_types=62".withCString { cstr in
-                        av_opt_set(bsf.pointee.priv_data, "remove_types", "62", 0)
-                    }
-                    let initRet = av_bsf_init(bsf)
-                    if parCopy >= 0, initRet >= 0 {
-                        self.dvRpuFilter = bsf
-                        EngineLog.emit(
-                            "[HLSSegmentProducer] DV RPU strip wired via filter_units BSF (remove_types=62)",
-                            category: .session
-                        )
-                    } else {
-                        av_bsf_free(&bsfPtr)
-                        EngineLog.emit(
-                            "[HLSSegmentProducer] DV RPU strip init failed "
-                            + "(parCopy=\(parCopy) bsfInit=\(initRet)); strip disabled, "
-                            + "playback proceeds without filtering",
-                            category: .session
-                        )
-                    }
-                } else {
-                    EngineLog.emit(
-                        "[HLSSegmentProducer] DV RPU strip: av_bsf_alloc failed (\(allocRet)); "
-                        + "strip disabled",
-                        category: .session
-                    )
-                }
-            } else {
-                EngineLog.emit(
-                    "[HLSSegmentProducer] DV RPU strip: filter_units BSF not in this FFmpeg "
-                    + "build; strip disabled",
-                    category: .session
-                )
-            }
         }
 
         // 4b. Add the audio output stream (if any). Stream-copy and
@@ -954,45 +862,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // the backfill condition (`prev.duration == 0`)
                 // never fires.
                 if isVideoPkt {
-                    if let bsf = dvRpuFilter {
-                        let inputSize = packet.pointee.size
-                        // BSF send takes ownership of the packet's
-                        // refcounted payload (after send, packet is
-                        // empty / unreffed). Then receive fills it
-                        // back with the filtered output. filter_units
-                        // is synchronous and 1-in-1-out so a single
-                        // send+receive is sufficient.
-                        let sendRet = av_bsf_send_packet(bsf, packet)
-                        if sendRet >= 0 {
-                            let recvRet = av_bsf_receive_packet(bsf, packet)
-                            if recvRet >= 0 {
-                                let delta = packet.pointee.size - inputSize
-                                if delta < 0, !loggedFirstRPUStrip {
-                                    loggedFirstRPUStrip = true
-                                    EngineLog.emit(
-                                        "[HLSSegmentProducer] DV RPU strip active: "
-                                        + "first packet shrunk by \(-delta) B "
-                                        + "(in=\(inputSize) → out=\(packet.pointee.size))",
-                                        category: .session
-                                    )
-                                }
-                            } else if recvRet != AVERROR_EAGAIN_VALUE {
-                                EngineLog.emit(
-                                    "[HLSSegmentProducer] DV RPU BSF recv error \(recvRet); "
-                                    + "packet may be empty",
-                                    category: .session
-                                )
-                            }
-                        }
-                    }
                     if !loggedFirstVideoPktInfo {
                         loggedFirstVideoPktInfo = true
                         EngineLog.emit(
                             "[HLSSegmentProducer] first video pkt: "
                             + "dts=\(packet.pointee.dts) pts=\(packet.pointee.pts) "
                             + "duration=\(packet.pointee.duration) size=\(packet.pointee.size) "
-                            + "(fallback=\(videoFallbackDurationPts) in srcVideoTb, "
-                            + "stripDVRPU=\(stripDVRPU))",
+                            + "(fallback=\(videoFallbackDurationPts) in srcVideoTb)",
                             category: .session
                         )
                     }
@@ -1258,9 +1134,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - Cleanup
 
     private func cleanup() {
-        if dvRpuFilter != nil {
-            av_bsf_free(&dvRpuFilter)
-        }
         if let ctx = formatContext {
             // Clear opaque first so any late io_open from the muxer's
             // own teardown path doesn't dereference a self that's about

@@ -4,47 +4,63 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// Per-segment fragmented MP4 muxer. Replaces the long-lived libavformat
-/// `hls` muxer that accumulated state across the full session and
-/// caused the long-form 4K HDR HEVC memory leak (libavformat hlsenc +
-/// mp4 sub-muxer holding ~6 MB/sec of internal sample-table + sidx +
-/// delay_moov state per the producer-restart diagnostic that freed
-/// 840 MB in one teardown).
+/// Long-lived fragmented-MP4 muxer driving the HLS-fMP4 segments for
+/// one playback session. Replaces the libavformat `hls` muxer that
+/// accumulated state across the session and caused the long-form 4K
+/// HDR HEVC memory leak (the producer-restart diagnostic freed 840 MB
+/// in one teardown).
 ///
-/// Architecture: one `AVFormatContext` per segment, configured as a
-/// plain `mp4` muxer (not `hls` wrapper) with movflags that match
-/// Apple's HLS-fMP4 spec but DON'T accumulate state across fragments:
+/// Earlier iteration: per-segment fresh AVFormatContext. Memory leak
+/// solved but produced A/V tfdt mismatches at fragment boundaries —
+/// FLAC bridge emits packets at fixed 4096-sample (~85 ms) granularity
+/// and matroska interleaves audio AHEAD of video, so the first audio
+/// packet of each segment muxer landed ~160 ms BEFORE the video tfdt
+/// of the same fragment. AVPlayer accepted the first few segments and
+/// then froze with audio drop as drift accumulated. The mp4 muxer's
+/// `av_interleaved_write_frame` queue handles cross-stream sync
+/// internally; we lost it when we switched to per-segment.
 ///
-///   +empty_moov         — moov written eagerly at write_header, no
-///                          samples carried in moov, all sample data
-///                          lives in per-fragment moofs
+/// Current architecture: ONE AVFormatContext for the whole session,
+/// configured as a plain `mp4` muxer (not `hls` wrapper) with these
+/// movflags:
+///
+///   +empty_moov         — moov written eagerly at write_header
 ///   +default_base_moof  — relative offsets in tfhd (cleaner fmp4)
-///   +frag_keyframe      — auto-cut fragment at every keyframe; our
-///                          segments are keyframe-aligned by design
-///                          so each muxer produces exactly one moof+mdat
-///   (omitted: +delay_moov, +dash, +frag_custom — these were the
-///   leak source)
+///   +frag_custom        — caller controls fragment cuts via
+///                          `av_write_frame(ctx, nil)`. The mp4
+///                          muxer's internal interleave queue holds
+///                          packets until cut time, naturally
+///                          aligning audio + video at fragment
+///                          boundaries.
 ///
-/// Output flow per segment:
+///   (notably NOT: +delay_moov, +dash, +frag_keyframe — these were
+///   the leak source. Without +delay_moov the moov is written upfront
+///   empty. Without +dash there's no sidx accumulator across
+///   fragments. mfra at trailer is tiny per-fragment metadata; the
+///   FragmentSplitter discards it.)
 ///
-///   1. allocate fresh AVFormatContext (mp4 muxer)
-///   2. add video stream (codecpar copied from source, codec_tag set)
-///   3. optionally add audio stream
-///   4. avformat_write_header → emits ftyp + moov via io trampoline
-///   5. caller pumps packets via writePacket()
-///   6. av_write_trailer → flushes final moof + mdat, may emit mfra
-///   7. avformat_free_context → ALL internal state released
+/// Output flow per session:
 ///
-/// The `FragmentSplitter` parses the io output stream and routes the
-/// ftyp + moov portion to the init-handler callback (consumer dedupes
-/// against the pre-built init.mp4) and the moof + mdat portion straight
-/// to a POSIX-staging file. `mfra` and any trailing boxes are discarded.
+///   1. allocate ONE AVFormatContext (mp4 muxer)
+///   2. add video + optional audio streams
+///   3. avformat_write_header → emits ftyp + moov via avio callback
+///   4. caller pumps packets via writePacket() — muxer queues them
+///   5. at each segment boundary the caller calls
+///      cutFragmentForNextSegment(_:) → muxer flushes the queued
+///      packets as one moof+mdat via avio callback → splitter routes
+///      the bytes to the current segment's POSIX file → fd is rotated
+///      to the next segment's file
+///   6. at session end: finalize() → final flush + write_trailer +
+///      free_context
 ///
-/// AVPlayer compatibility: per the Apple HLS Authoring Spec, fMP4
+/// The `FragmentSplitter` parses the avio output stream and routes
+/// the ftyp + moov portion to the init-handler callback (= init.mp4
+/// content) and the per-fragment moof + mdat bytes to the currently-
+/// open segment file. `mfra` at trailer is discarded.
+///
+/// AVPlayer compatibility: per Apple's HLS Authoring Spec, fMP4
 /// segments need `moof + mdat` with `tfdt` carrying decode time, and
 /// movie-fragment-relative addressing. No `styp` / `sidx` required.
-/// Tested as-emitted by the mp4 muxer with these flags against
-/// AVPlayer on tvOS 26.
 final class MP4SegmentMuxer {
 
     // MARK: - Types
@@ -85,33 +101,36 @@ final class MP4SegmentMuxer {
 
     // MARK: - State
 
-    /// Segment index this muxer is writing. Used in the staging
-    /// filename and dispatched alongside the bytesWritten count when
-    /// the segment finalizes so the caller's cache can adopt it under
-    /// the right key.
-    let segmentIndex: Int
+    /// Index of the segment whose bytes are currently flowing into
+    /// `fd`. The mp4 muxer is fragment-agnostic — it just emits
+    /// moof+mdat blocks on `av_write_frame(ctx, nil)` calls. We track
+    /// the index here and rotate `fd` between cuts so each fragment's
+    /// bytes land in a separate file.
+    private(set) var currentSegmentIndex: Int
 
-    /// Disk path the FragmentSplitter writes fragment bytes into.
-    /// Lives under the cache's session directory so the cache's
-    /// final adopt is a same-volume rename (metadata-only, no copy).
-    private let stagingPath: URL
+    /// Cache session directory where staging files live. Same volume
+    /// as the cache's adopt target so the rename is metadata-only.
+    private let sessionDir: URL
 
-    /// Open POSIX file descriptor for the staging file. Closed in
-    /// finalize() before the cache adopts the file.
+    /// Current staging file's full path. Replaced at each fragment
+    /// cut; the previous path is returned to the caller for cache
+    /// adoption.
+    private var currentStagingPath: URL
+
+    /// Open POSIX file descriptor for the current segment's staging
+    /// file. Closed + replaced at each fragment cut, closed for the
+    /// final time in finalize().
     private var fd: Int32 = -1
 
-    /// AVFormatContext for the mp4 muxer. Always paired with a sink
-    /// holding the avio buffer / FragmentSplitter via the format
-    /// context's opaque + io_open trampolines.
+    /// AVFormatContext for the mp4 muxer. ONE instance for the whole
+    /// session — see class docstring for why per-segment was tried and
+    /// reverted.
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
 
-    /// Bytes appended to the staging file. Reported to the caller
-    /// at finalize() time for cache accounting + memprobe stats.
-    private(set) var bytesWritten: Int = 0
-
-    /// Sticky once any write fails. finalize() discards the staging
-    /// file if set, instead of adopting half-written content.
-    private var writeFailed: Bool = false
+    /// AVIO context attached to `ctx.pb`. Allocated in init, freed in
+    /// cleanup(). The mp4 muxer writes through this context; bytes
+    /// route through `mp4SegmentMuxerSinkWrite` → `splitter` → fd.
+    private var pb: UnsafeMutablePointer<AVIOContext>?
 
     /// Latched once avformat_write_header succeeds and av_write_trailer
     /// becomes safe to call. Guards against double-trailer if the
@@ -120,8 +139,8 @@ final class MP4SegmentMuxer {
 
     /// Muxer's chosen time_base for the video output stream, latched
     /// after avformat_write_header. The mp4 muxer rewrites the stream's
-    /// time_base to its own auto-pick (usually 1/<sample rate>-ish or
-    /// 1/12800 for video at common frame rates); subsequent
+    /// time_base to its own auto-pick (usually 1/16000 for 24 fps
+    /// video, 1/<sample rate> for audio); subsequent
     /// av_packet_rescale_ts calls target this time_base.
     private(set) var muxerVideoTimeBase: AVRational = AVRational(num: 1, den: 1)
     private(set) var muxerAudioTimeBase: AVRational = AVRational(num: 1, den: 1)
@@ -133,74 +152,60 @@ final class MP4SegmentMuxer {
 
     /// The FragmentSplitter that parses the avio output stream and
     /// routes header vs fragment bytes. Owned strongly here so its
-    /// closures stay alive for the muxer's lifetime; the C trampoline
-    /// recovers it via the avio context's opaque pointer.
+    /// closures stay alive for the muxer's lifetime; the avio write
+    /// callback recovers it via the pb opaque pointer.
     private let splitter: FragmentSplitter
 
     // MARK: - Init
 
-    /// Build a muxer for one segment. `onInitCaptured` fires when this
-    /// muxer's ftyp + moov bytes are complete; the caller typically
-    /// uses it to populate the session's init.mp4 on the first muxer
-    /// and ignores the call (or verifies byte-stability) for subsequent
-    /// muxers.
+    /// Build the session-long muxer, opening its first segment file.
+    /// `onInitCaptured` fires once when the ftyp + moov bytes finish
+    /// streaming through the avio buffer (= init.mp4 content).
+    ///
+    /// Subsequent fragment cuts re-route bytes via
+    /// `cutFragmentForNextSegment(_:)`. The avformat context and avio
+    /// context live for the whole session.
     ///
     /// Throws on any libavformat init failure or staging-file open
-    /// failure. The instance is unusable after a throw; callers must
-    /// not call writePacket / finalize on it.
+    /// failure. The instance is unusable after a throw.
     init(
-        segmentIndex: Int,
+        initialSegmentIndex: Int,
         sessionDir: URL,
         video: VideoConfig,
         audio: AudioConfig?,
         targetSegmentDurationSeconds: Double,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
-        self.segmentIndex = segmentIndex
+        self.currentSegmentIndex = initialSegmentIndex
+        self.sessionDir = sessionDir
         self.haveAudio = audio != nil
 
-        // Staging file: same naming as the old SegmentSink path so
-        // SegmentCache.adopt can rename it into place without changing
-        // the cache API.
-        self.stagingPath = sessionDir.appendingPathComponent(
-            "staging-seg-\(segmentIndex)-\(UUID().uuidString.prefix(8)).tmp"
-        )
-        let cPath = stagingPath.withUnsafeFileSystemRepresentation { ptr -> [CChar] in
-            guard let p = ptr else { return [] }
-            var arr = [CChar]()
-            var i = 0
-            while p[i] != 0 { arr.append(p[i]); i += 1 }
-            arr.append(0)
-            return arr
-        }
-        guard !cPath.isEmpty else {
-            throw MuxerError.openStagingFileFailed(errno: EINVAL)
-        }
-        let fd = cPath.withUnsafeBufferPointer { buf -> Int32 in
-            // creat == open(O_WRONLY | O_CREAT | O_TRUNC, mode). Swift
-            // on Darwin marks variadic open() unavailable; creat is the
-            // non-variadic equivalent for this exact pattern.
-            return creat(buf.baseAddress, 0o644)
-        }
-        guard fd >= 0 else {
-            throw MuxerError.openStagingFileFailed(errno: errno)
-        }
-        self.fd = fd
+        // Open the first segment's staging file. Subsequent segments
+        // open their own files inside cutFragmentForNextSegment(_:).
+        let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
+                                         in: sessionDir)
+        self.currentStagingPath = firstPath
+        let firstFd = try Self.openPosix(path: firstPath)
+        self.fd = firstFd
 
-        // Captured-byte counters surfaced into closures via a tiny
-        // ref-typed counter box. Splitter callbacks update the box;
-        // finalize() reads it. We can't capture `self` directly in
-        // the closures because `self` is being initialized.
+        // Mutable ref-typed counter is shared between the splitter's
+        // non-self-capturing fragment-write closure and the muxer's
+        // fragment-cut state. The closure can't capture `self`
+        // directly (we're still inside init); the counter struct +
+        // the muxer's fd-rotation logic both read / write through it.
         let counter = ByteCounter()
+        counter.fd = firstFd
+        self.byteCounter = counter
+
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
                 onInitCaptured(initBytes)
             },
             onFragmentBytes: { ptr, count in
-                if counter.writeFailed { return }
+                guard !counter.writeFailed, counter.fd >= 0 else { return }
                 var written = 0
                 while written < count {
-                    let n = write(fd, ptr.advanced(by: written), count - written)
+                    let n = write(counter.fd, ptr.advanced(by: written), count - written)
                     if n < 0 {
                         let err = errno
                         if err == EINTR { continue }
@@ -213,10 +218,9 @@ final class MP4SegmentMuxer {
                     }
                     written += n
                 }
-                counter.bytesWritten += count
+                counter.bytesWrittenCurrentSegment += count
             }
         )
-        self.byteCounter = counter
 
         // Allocate the mp4 muxer. URL string is a placeholder; the
         // muxer never opens a real file because we hand it our own
@@ -224,8 +228,8 @@ final class MP4SegmentMuxer {
         var ctxOut: UnsafeMutablePointer<AVFormatContext>?
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "segment.m4s")
         guard allocRet == 0, let ctx = ctxOut else {
-            close(fd)
-            try? FileManager.default.removeItem(at: stagingPath)
+            close(firstFd)
+            try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.allocFailed(code: allocRet)
         }
         self.formatContext = ctx
@@ -240,16 +244,15 @@ final class MP4SegmentMuxer {
         // FragmentSplitter. The mp4 muxer writes directly to `s->pb`;
         // unlike hlsenc it does NOT call `s->io_open` to allocate one
         // on demand, so we must have a real pb in place before
-        // avformat_write_header runs (the previous trampoline-only
-        // wiring crashed in mov_init at first pb dereference with a
-        // 0x90-offset EXC_BAD_ACCESS).
+        // avformat_write_header runs.
         guard let pb = Self.allocAVIOContext(muxer: self) else {
             avformat_free_context(ctx)
             self.formatContext = nil
-            close(fd)
-            try? FileManager.default.removeItem(at: stagingPath)
+            close(firstFd)
+            try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.avioAllocFailed
         }
+        self.pb = pb
         ctx.pointee.pb = pb
 
         // Video stream.
@@ -282,16 +285,15 @@ final class MP4SegmentMuxer {
             audioStream.pointee.time_base = audio.timeBase
         }
 
-        // Movflags: the leak-free three. See class docstring.
+        // Movflags: the leak-free trio. See class docstring.
+        // +frag_custom puts fragment cuts under explicit caller control
+        // via av_write_frame(ctx, nil); the mp4 muxer's interleave
+        // queue holds packets between cuts so audio + video align at
+        // fragment boundaries on its own.
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
-        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_keyframe", 0)
-        // hls_time-equivalent. With +frag_keyframe the muxer
-        // auto-cuts at every keyframe; our segments are keyframe-
-        // aligned so this is one fragment per muxer. Setting
-        // frag_duration as a defensive backstop doesn't hurt.
-        let fragMs = Int(targetSegmentDurationSeconds * 1_000_000)
-        av_dict_set(&opts, "frag_duration", String(fragMs), 0)
+        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom", 0)
+        _ = targetSegmentDurationSeconds  // currently unused — frag_custom drives cuts
 
         let ret = avformat_write_header(ctx, &opts)
         guard ret >= 0 else {
@@ -328,40 +330,134 @@ final class MP4SegmentMuxer {
         return av_interleaved_write_frame(ctx, packet)
     }
 
-    /// Finalize the segment: write trailer, close staging file, free
-    /// the format context, and return a (path, bytesWritten) tuple
-    /// the caller can hand to the cache for adoption. Returns nil if
-    /// any write failed during the segment's lifetime.
+    /// Trigger a fragment cut, finalize the just-completed segment's
+    /// file, and rotate `fd` to a freshly-opened file for `nextIdx`.
+    ///
+    /// Sequence:
+    ///   1. `av_write_frame(ctx, nil)` — mp4 muxer's `+frag_custom`
+    ///      path flushes the queued packets as one moof+mdat block.
+    ///      Bytes flow through the avio callback → FragmentSplitter
+    ///      → current `fd`.
+    ///   2. After the flush returns, the current segment is fully
+    ///      written. We close `fd`, capture its byte count and path,
+    ///      and reset the counter.
+    ///   3. Open a fresh staging file for `nextIdx`, set it as the
+    ///      new `fd`. Subsequent packet writes accumulate inside the
+    ///      muxer until the next cut.
+    ///
+    /// Returns `(path, bytes)` for the segment that was just
+    /// completed (= the one whose index was `currentSegmentIndex`
+    /// before this call), or `nil` if any write failed or the new
+    /// file couldn't be opened. On a nil return the muxer state may
+    /// be inconsistent; the caller should bail.
+    func cutFragmentForNextSegment(_ nextIdx: Int) -> (path: URL, bytesWritten: Int)? {
+        guard let ctx = formatContext, headerWritten, fd >= 0 else { return nil }
+
+        // 1. Flush the queued fragment via the mp4 muxer's frag_custom
+        //    path. Bytes for the just-completed segment are written
+        //    to the current `fd` via the avio callback.
+        _ = av_write_frame(ctx, nil)
+
+        // 2. Snapshot the completed segment + reset counters.
+        let completedPath = currentStagingPath
+        let completedBytes = byteCounter.bytesWrittenCurrentSegment
+        let completedFailed = byteCounter.writeFailed
+        close(fd)
+        fd = -1
+        byteCounter.fd = -1
+        byteCounter.bytesWrittenCurrentSegment = 0
+
+        if completedFailed || completedBytes == 0 {
+            try? FileManager.default.removeItem(at: completedPath)
+            return nil
+        }
+
+        // 3. Rotate to the next segment's staging file.
+        let nextPath = Self.stagingPath(forSegmentIndex: nextIdx, in: sessionDir)
+        do {
+            let nextFd = try Self.openPosix(path: nextPath)
+            self.fd = nextFd
+            self.currentStagingPath = nextPath
+            self.currentSegmentIndex = nextIdx
+            byteCounter.fd = nextFd
+        } catch {
+            // Failed to open the next file. Caller should give up on
+            // this session; we can't keep producing.
+            return (path: completedPath, bytesWritten: completedBytes)
+        }
+
+        return (path: completedPath, bytesWritten: completedBytes)
+    }
+
+    /// Final teardown at session end. Triggers one last fragment cut
+    /// for whatever's queued (= the final segment), writes the mp4
+    /// trailer (which may emit a small mfra the splitter discards),
+    /// closes the current fd, and frees the format context + AVIO.
+    ///
+    /// Returns the final segment's `(path, bytes)` for cache adoption,
+    /// or nil on any failure.
     func finalize() -> (path: URL, bytesWritten: Int)? {
         defer { cleanup() }
 
-        // av_write_trailer may emit additional bytes (mfra etc.).
-        // Those flow through the splitter which discards anything
-        // not moof/mdat. Safe to call even if some packet writes
-        // failed mid-segment; the muxer will at least close its
-        // internal state cleanly.
-        if let ctx = formatContext, headerWritten {
-            _ = av_write_trailer(ctx)
+        guard let ctx = formatContext, headerWritten else {
+            if fd >= 0 { close(fd); fd = -1 }
+            try? FileManager.default.removeItem(at: currentStagingPath)
+            return nil
         }
+
+        // Final fragment flush + trailer. Both write through the
+        // avio callback → splitter → current fd.
+        _ = av_write_frame(ctx, nil)
+        _ = av_write_trailer(ctx)
+
+        let finalPath = currentStagingPath
+        let finalBytes = byteCounter.bytesWrittenCurrentSegment
+        let finalFailed = byteCounter.writeFailed
 
         if fd >= 0 {
             close(fd)
             fd = -1
+            byteCounter.fd = -1
         }
 
-        // Pull the final write status off the shared counter. If
-        // any write returned an error during the segment, discard
-        // the staging file rather than handing a partial segment to
-        // the cache.
-        let succeeded = !byteCounter.writeFailed && byteCounter.bytesWritten > 0
-        self.bytesWritten = byteCounter.bytesWritten
-        self.writeFailed = byteCounter.writeFailed
-
-        if succeeded {
-            return (path: stagingPath, bytesWritten: byteCounter.bytesWritten)
+        if finalFailed || finalBytes == 0 {
+            try? FileManager.default.removeItem(at: finalPath)
+            return nil
         }
-        try? FileManager.default.removeItem(at: stagingPath)
-        return nil
+        return (path: finalPath, bytesWritten: finalBytes)
+    }
+
+    // MARK: - Path helpers
+
+    /// Staging filename for a segment index. Lives under the cache's
+    /// session directory so the cache adopt is a metadata-only rename.
+    private static func stagingPath(forSegmentIndex idx: Int, in sessionDir: URL) -> URL {
+        sessionDir.appendingPathComponent(
+            "staging-seg-\(idx)-\(UUID().uuidString.prefix(8)).tmp"
+        )
+    }
+
+    /// Open a staging file via POSIX `creat(2)`. Throws if the open
+    /// fails (parent dir not writable, disk full, etc).
+    private static func openPosix(path: URL) throws -> Int32 {
+        let cPath = path.withUnsafeFileSystemRepresentation { ptr -> [CChar] in
+            guard let p = ptr else { return [] }
+            var arr = [CChar]()
+            var i = 0
+            while p[i] != 0 { arr.append(p[i]); i += 1 }
+            arr.append(0)
+            return arr
+        }
+        guard !cPath.isEmpty else {
+            throw MuxerError.openStagingFileFailed(errno: EINVAL)
+        }
+        let fd = cPath.withUnsafeBufferPointer { buf -> Int32 in
+            creat(buf.baseAddress, 0o644)
+        }
+        guard fd >= 0 else {
+            throw MuxerError.openStagingFileFailed(errno: errno)
+        }
+        return fd
     }
 
     // MARK: - Internal cleanup
@@ -457,7 +553,13 @@ final class MP4SegmentMuxer {
 /// so the closures can mutate it without capturing `self` (which
 /// doesn't exist yet during init).
 private final class ByteCounter {
-    var bytesWritten: Int = 0
+    /// fd the splitter's fragment-byte callback writes to. Rotated
+    /// when the muxer cuts a fragment.
+    var fd: Int32 = -1
+    /// Bytes written to the current segment's file since the last
+    /// fragment cut. Reset at each cut.
+    var bytesWrittenCurrentSegment: Int = 0
+    /// Sticky once any `write(2)` call returns an error.
     var writeFailed: Bool = false
 }
 

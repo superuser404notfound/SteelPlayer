@@ -468,27 +468,37 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// during the backpressure wait or a new muxer alloc failed.
     private func ensureMuxer(forSegmentIndex targetIdx: Int) -> MP4SegmentMuxer? {
         let effectiveIdx = max(targetIdx, currentMuxerSegmentIndex)
-        if currentMuxer?.segmentIndex == effectiveIdx, let m = currentMuxer { return m }
 
-        // Finalize the existing muxer first so its bytes land in the
-        // cache before the producer races into the next segment.
-        if let old = currentMuxer {
-            finalizeAndAdoptCurrentMuxer(old)
-            currentMuxer = nil
-            currentMuxerSegmentIndex = .min
+        // Hot path: muxer exists AND currently writing the desired
+        // segment.
+        if let m = currentMuxer, m.currentSegmentIndex == effectiveIdx {
+            return m
         }
 
-        // Producer backpressure: don't run more than `bufferAheadSegments`
-        // ahead of AVPlayer's declared target. The cache exposes a
-        // condvar-based highwater wait we poll in short chunks so
-        // `stop()` can shut us down promptly.
-        let backpressureTarget = effectiveIdx - Self.bufferAheadSegments
+        // First-time alloc: build the single session-wide muxer and
+        // open its first segment's staging file.
+        if currentMuxer == nil {
+            return allocateMuxer(initialSegmentIndex: effectiveIdx)
+        }
+
+        // Forward boundary crossing on an existing muxer: trigger a
+        // fragment cut. The muxer flushes the in-flight fragment to
+        // the old segment's fd, adopts that file into the cache, and
+        // rotates fd + currentSegmentIndex to the new segment.
+        return advanceMuxer(to: effectiveIdx)
+    }
+
+    /// First-time allocation of the session's single mp4 muxer. Wires
+    /// the init.mp4 callback so the cache gets seeded once.
+    private func allocateMuxer(initialSegmentIndex: Int) -> MP4SegmentMuxer? {
+        // Backpressure even on the first segment so the producer
+        // doesn't try to allocate ahead of AVPlayer's declared target.
+        let backpressureTarget = initialSegmentIndex - Self.bufferAheadSegments
         while !checkShouldStop() {
             if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
         }
         if checkShouldStop() { return nil }
 
-        // Build the muxer for the target segment.
         let muxerVideo = MP4SegmentMuxer.VideoConfig(
             codecpar: videoConfig.codecpar,
             timeBase: videoConfig.timeBase,
@@ -498,10 +508,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase)
         }
 
-        let muxer: MP4SegmentMuxer
         do {
-            muxer = try MP4SegmentMuxer(
-                segmentIndex: effectiveIdx,
+            let muxer = try MP4SegmentMuxer(
+                initialSegmentIndex: initialSegmentIndex,
                 sessionDir: cache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
@@ -516,28 +525,58 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             category: .session
                         )
                     }
-                    // Subsequent muxers' init bytes are byte-equivalent
-                    // (same codecpar + flags); ignore.
                 }
             )
+            self.currentMuxer = muxer
+            self.currentMuxerSegmentIndex = initialSegmentIndex
+            return muxer
         } catch {
             EngineLog.emit(
-                "[HLSSegmentProducer] muxer alloc for seg-\(effectiveIdx) failed: \(error)",
+                "[HLSSegmentProducer] muxer alloc for seg-\(initialSegmentIndex) failed: \(error)",
                 category: .session
             )
             return nil
         }
+    }
 
-        currentMuxer = muxer
-        currentMuxerSegmentIndex = effectiveIdx
+    /// Cross a fragment boundary on the existing single-session muxer:
+    /// trigger a fragment cut (= flush queued packets + close the
+    /// completed segment's fd + open the next segment's fd), then
+    /// apply the cache-window backpressure for the new index.
+    private func advanceMuxer(to newIdx: Int) -> MP4SegmentMuxer? {
+        guard let muxer = currentMuxer else { return nil }
+
+        if let result = muxer.cutFragmentForNextSegment(newIdx) {
+            EngineLog.emit(
+                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(result.bytesWritten) B)",
+                category: .session
+            )
+            cache.adopt(index: currentMuxerSegmentIndex,
+                        stagingPath: result.path,
+                        byteCount: result.bytesWritten)
+        } else {
+            EngineLog.emit(
+                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut failed; not adopted",
+                category: .session
+            )
+        }
+        currentMuxerSegmentIndex = newIdx
+
+        // Producer backpressure for the new segment.
+        let backpressureTarget = newIdx - Self.bufferAheadSegments
+        while !checkShouldStop() {
+            if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
+        }
+        if checkShouldStop() { return nil }
+
         return muxer
     }
 
-    /// Finalize the supplied muxer and adopt its staging file into
-    /// the cache. Logs the result. Always called via `ensureMuxer`
-    /// (boundary crossing) or pump exit (final segment).
-    private func finalizeAndAdoptCurrentMuxer(_ muxer: MP4SegmentMuxer) {
-        let idx = muxer.segmentIndex
+    /// Finalize the session-wide muxer at pump exit and adopt the
+    /// final segment.
+    private func finalizeSessionMuxerAndAdopt() {
+        guard let muxer = currentMuxer else { return }
+        let idx = currentMuxerSegmentIndex
         if let result = muxer.finalize() {
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(idx).m4s captured (\(result.bytesWritten) B)",
@@ -547,21 +586,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         byteCount: result.bytesWritten)
         } else {
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(idx).m4s finalize failed; not adopted",
+                "[HLSSegmentProducer] seg-\(idx).m4s final finalize failed; not adopted",
                 category: .session
             )
         }
+        currentMuxer = nil
+        currentMuxerSegmentIndex = .min
     }
 
     deinit {
         // Defensive: if the pump was killed without running the
-        // muxer-finalize path, drop the unfinished segment's staging
-        // file rather than leaking it. MP4SegmentMuxer's deinit also
-        // closes its fd; this guards against the muxer outliving the
-        // producer accidentally.
-        if let m = currentMuxer {
-            _ = m.finalize()
-            currentMuxer = nil
+        // muxer-finalize path, finalize once more. The muxer's deinit
+        // also closes its fd; this is belt-and-suspenders.
+        if currentMuxer != nil {
+            finalizeSessionMuxerAndAdopt()
         }
     }
 
@@ -1159,14 +1197,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
             pendingAudioPkt = nil
         }
 
-        // Finalize the last segment's muxer so its bytes land in the
-        // cache. Per-segment teardown owns the libavformat state
-        // cleanup, no global av_write_trailer needed.
-        if let muxer = currentMuxer {
-            finalizeAndAdoptCurrentMuxer(muxer)
-            currentMuxer = nil
-            currentMuxerSegmentIndex = .min
-        }
+        // Finalize the session-wide muxer's final segment so its
+        // bytes land in the cache. write_trailer also fires inside
+        // finalize() for the libavformat-side cleanup.
+        finalizeSessionMuxerAndAdopt()
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
             "[HLSSegmentProducer] pump finished: packetsRead=\(packetsRead) "

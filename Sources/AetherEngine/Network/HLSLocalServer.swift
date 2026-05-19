@@ -736,6 +736,18 @@ final class HLSLocalServer: @unchecked Sendable {
         if typeIsEvent {
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
+        } else {
+            // Without EXT-X-PLAYLIST-TYPE:VOD AVPlayer treats the playlist
+            // as potentially mutable and retains every fetched segment in
+            // process memory in case a later refresh extends the window.
+            // With ENDLIST present the playlist is by definition final,
+            // but the explicit VOD tag is what lets AVPlayer prune fetched
+            // segments past the buffer-behind window. Without it RSS grows
+            // linearly with segment count for the entire playback (the
+            // libavformat hlsenc + ffmpeg-cli reference build sets this
+            // when -hls_playlist_type vod is on; matching that output is
+            // the only reason our Mac AirPlay reference run stays flat).
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         }
         lines.append("#EXT-X-MAP:URI=\"init.mp4\"")
         for i in 0..<count {

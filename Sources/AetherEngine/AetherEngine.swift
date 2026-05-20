@@ -677,22 +677,23 @@ public final class AetherEngine: ObservableObject {
                 self.sourceTime = self.currentTime + seconds
             }
         }
-        // Hybrid path: AVPlayer fetches the small HLS playlist via
-        // HTTP loopback (negligible CFNetwork traffic, ~60 KB once per
-        // session), then routes the heavy init.mp4 + segment fetches
-        // through our AVAssetResourceLoaderDelegate via absolute
-        // `aether-engine://` URIs the playlist generator emits. The
-        // delegate bypasses CFNetwork entirely for the bulk data,
-        // killing the `VM: libnetwork` leak Instruments pinpointed on
-        // 2026-05-20 while keeping AVPlayer's HLS engine happy (which
-        // requires an HTTP playlist as the asset entry point).
+        // AVPlayer HLS playback over the loopback HTTP server.
+        //
+        // (Tried two AVAssetResourceLoaderDelegate variants on
+        // 2026-05-20 to bypass CFNetwork — a pure custom-scheme asset
+        // URL and a hybrid HTTP-playlist + custom-scheme-sub-resources
+        // path. Both failed with CoreMedia -12881
+        // (FigHTTPStreamReader parse error) AFTER the delegate
+        // delivered byte-correct init.mp4 and seg0 to AVPlayer. The
+        // bytes flow is verifiably right; AVPlayer's HLS engine
+        // appears to reject delegate-served segment data regardless
+        // of how the playlist arrives. Apple's documented uses of
+        // AVAssetResourceLoaderDelegate are FairPlay HLS keys,
+        // custom-encrypted assets, and on-disk caching — not plain
+        // HLS sub-resource delivery. Reverted to HTTP-only for the
+        // playback path while we evaluate alternatives.)
         let playbackURL = try session.start()
-        let resourceLoaderDelegate: AVAssetResourceLoaderDelegate?
-        if let handle = session.resourceLoader() {
-            resourceLoaderDelegate = handle.delegate
-        } else {
-            resourceLoaderDelegate = nil
-        }
+        let resourceLoaderDelegate: AVAssetResourceLoaderDelegate? = nil
         self.nativeVideoSession = session
 
         let host = NativeAVPlayerHost()

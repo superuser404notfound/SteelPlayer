@@ -478,6 +478,7 @@ public final class AetherEngine: ObservableObject {
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
         let probe = Demuxer()
+        var probeOpened = false
         do {
             // Detach the HTTP probe + avformat_open_input + avformat_find_stream_info
             // off the @MainActor so the SwiftUI host stays responsive.
@@ -491,6 +492,7 @@ public final class AetherEngine: ObservableObject {
             try await Task.detached(priority: .userInitiated) { [probe] in
                 try probe.open(url: url, extraHeaders: options.httpHeaders)
             }.value
+            probeOpened = true
             let videoIdx = probe.videoStreamIndex
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {
                 detectedFormat = Self.detectVideoFormat(stream: stream)
@@ -505,7 +507,12 @@ public final class AetherEngine: ObservableObject {
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
             probedDefaultAudioIndex = probe.audioStreamIndex
-            probe.close()
+            // probe.close() deferred: ownership transfers to
+            // `loadNative` (native dispatch) which hands it to
+            // HLSVideoEngine for reuse, or we close it explicitly in
+            // the software dispatch branch below since SW path opens
+            // its own Demuxer. On the error path probe was never
+            // opened, so close is a no-op.
         } catch {
             EngineLog.emit("[AetherEngine] probe failed (\(error)); proceeding without criteria", category: .engine)
         }
@@ -599,6 +606,12 @@ public final class AetherEngine: ObservableObject {
 
         do {
             if useSoftwarePath {
+                // SW path opens its own Demuxer inside
+                // SoftwarePlaybackHost.load — no reuse here. Close the
+                // probe so it doesn't linger as a parallel open
+                // AVFormatContext + AVIOReader for the entire SW
+                // playback session.
+                if probeOpened { probe.close() }
                 try await loadSoftware(
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
@@ -618,6 +631,15 @@ public final class AetherEngine: ObservableObject {
                 state = .playing
                 startMemoryProbe()
             } else {
+                // Native path: hand the probe Demuxer to loadNative.
+                // HLSVideoEngine.start() reuses it instead of running
+                // avformat_open_input + find_stream_info a second
+                // time, saving ~1-3 s of cold-start latency on slow
+                // CDN sources. The cue prewarm seek inside
+                // HLSVideoEngine.start invalidates any stale read
+                // position from the probe so position state is
+                // irrelevant. If probe failed to open, pass nil and
+                // HLSVideoEngine falls back to opening fresh.
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
@@ -626,7 +648,8 @@ public final class AetherEngine: ObservableObject {
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: options.panelIsInHDRMode,
-                    audioBridgeMode: options.audioBridgeMode
+                    audioBridgeMode: options.audioBridgeMode,
+                    preopenedDemuxer: probeOpened ? probe : nil
                 )
                 playbackBackend = .native
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -667,7 +690,8 @@ public final class AetherEngine: ObservableObject {
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
-        audioBridgeMode: AudioBridgeMode = .surroundCompat
+        audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        preopenedDemuxer: Demuxer? = nil
     ) async throws {
         let session = HLSVideoEngine(
             url: url,
@@ -679,7 +703,8 @@ public final class AetherEngine: ObservableObject {
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             initialPositionSeconds: startPosition,
-            audioBridgeMode: audioBridgeMode
+            audioBridgeMode: audioBridgeMode,
+            preopenedDemuxer: preopenedDemuxer
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }

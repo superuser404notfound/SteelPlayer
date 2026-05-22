@@ -320,7 +320,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
         initialPositionSeconds: Double? = nil,
-        audioBridgeMode: AudioBridgeMode = .surroundCompat
+        audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        preopenedDemuxer: Demuxer? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -332,12 +333,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
         self.initialPositionSeconds = initialPositionSeconds
         self.audioBridgeMode = audioBridgeMode
+        self.preopenedDemuxer = preopenedDemuxer
     }
 
     /// Encoder choice for the audio bridge (used for source codecs that
     /// can't stream-copy into fMP4: TrueHD, DTS, DTS-HD MA, MP3, Opus,
     /// and EAC3-from-MKV-without-dec3-extradata).
     private let audioBridgeMode: AudioBridgeMode
+
+    /// Optional Demuxer that the host already opened + ran
+    /// `find_stream_info` on (typically `AetherEngine.load`'s probe
+    /// Demuxer for the same URL). When non-nil, `start()` reuses this
+    /// instance instead of opening a fresh one, halving the
+    /// per-`load()` HTTP probe + `avformat_find_stream_info` work
+    /// (~1-3 s on slow CDN). Consumed in `start()`: cleared from
+    /// this property and assigned to `self.demuxer`. Unconsumed
+    /// preopened demuxers (e.g. if `start()` is never called before
+    /// `stop()`) are closed by `stop()` so the resource doesn't
+    /// linger after the engine is torn down.
+    private var preopenedDemuxer: Demuxer?
 
     /// Resume position used to seed the sliding-window playlist so its
     /// initial visible range covers the segment AVPlayer will seek to.
@@ -351,12 +365,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public func start() throws -> URL {
         guard demuxer == nil else { throw HLSVideoEngineError.alreadyStarted }
 
-        // 1. Open the source.
-        let dem = Demuxer()
-        do {
-            try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders)
-        } catch {
-            throw HLSVideoEngineError.openFailed(reason: "\(error)")
+        // 1. Open the source. If the caller pre-opened a Demuxer for
+        //    this URL (typically `AetherEngine.load`'s probe Demuxer)
+        //    reuse it — avformat_find_stream_info is already done,
+        //    AVIO buffer is warm, the seek that follows for cue
+        //    prewarm invalidates any stale read position. Saves
+        //    ~1-3 s per load on slow CDN sources by not running
+        //    open_input + find_stream_info twice.
+        let dem: Demuxer
+        if let preopened = preopenedDemuxer {
+            dem = preopened
+            preopenedDemuxer = nil
+        } else {
+            dem = Demuxer()
+            do {
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders)
+            } catch {
+                throw HLSVideoEngineError.openFailed(reason: "\(error)")
+            }
         }
         demuxer = dem
 
@@ -1063,6 +1089,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioBridge = nil
         let d = demuxer
         demuxer = nil
+        // Pick up the preopened Demuxer if start() never consumed it
+        // (e.g. an exception path before start()). Closing both d and
+        // preopened is safe: when start() ran, preopened was set to
+        // nil and only d holds the ref; when start() never ran, d is
+        // nil and preopened holds it. Calling close on a nil is a
+        // no-op; calling close twice is idempotent on Demuxer either
+        // way.
+        let preopened = preopenedDemuxer
+        preopenedDemuxer = nil
         provider = nil
         savedVideoConfig = nil
         savedAudioConfig = nil
@@ -1086,6 +1121,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             c?.close()
             ab?.close()
             d?.close()
+            preopened?.close()
         }
     }
 

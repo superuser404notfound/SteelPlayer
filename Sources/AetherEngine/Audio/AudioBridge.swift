@@ -3,15 +3,25 @@ import Libavcodec
 import Libavutil
 import Libswresample
 
-/// Source-to-FLAC transcoding bridge for the HLS-fMP4 video pipeline's
-/// audio sidecar. Decodes a source audio stream (TrueHD, DTS,
-/// DTS-HD MA, Vorbis, PCM, MP2) to PCM, resamples, re-encodes
-/// losslessly as FLAC, and emits encoded FLAC packets the
-/// `HLSSegmentProducer` writes alongside the video stream in the same
-/// fMP4 fragments. (EAC3 doesn't usually need bridging since AVPlayer
-/// can decode it natively; the EAC3-from-MKV-without-`dec3`-extradata
-/// header-write failure is what makes it the lone fMP4-legal codec
-/// that sometimes falls back to this path.)
+/// Source-to-mux-friendly transcoding bridge for the HLS-fMP4 video
+/// pipeline's audio sidecar. Decodes a source audio stream (TrueHD,
+/// DTS, DTS-HD MA, Vorbis, PCM, MP2) to PCM, resamples, re-encodes
+/// in one of two modes the caller picks, and emits encoded audio
+/// packets the `HLSSegmentProducer` writes alongside the video stream
+/// in the same fMP4 fragments.
+///
+/// Modes (see `AudioBridge.Mode`):
+///   - `.surroundCompat` (default): EAC3 5.1 at 384 kbps. AVPlayer
+///     hands the encoded bitstream to HDMI; the sink decodes its own
+///     5.1. Works on essentially every modern AVR + soundbar
+///     including LPCM-stereo-only routes (Sonos Arc, Samsung HW-Q,
+///     Bose, etc.) where the lossless FLAC path falls down. Lossy
+///     and caps at 5.1, so 7.1 sources lose SL/SR.
+///   - `.lossless`: FLAC up to 7.1 lossless. AVPlayer decodes to
+///     LPCM and routes via the active HDMI port. Needs a sink that
+///     accepts multichannel LPCM (Denon / Marantz / NAD high-end
+///     AVRs). On a stereo-LPCM route the multichannel LPCM gets
+///     downmixed to stereo before output.
 ///
 /// The motivation: AVPlayer's fMP4 decode path supports AAC / AC3 /
 /// EAC3 (incl. Atmos JOC) / FLAC / ALAC / MP3 / Opus directly, but
@@ -19,16 +29,36 @@ import Libswresample
 /// `dec3` box bytes need pre-parsed extradata that MKV CodecPrivate
 /// often doesn't carry, leading to `avformat_write_header` returning
 /// -22 EINVAL). TrueHD and DTS aren't legal in fMP4 at all per the
-/// ISOBMFF + Apple HLS spec. FLAC is legal, decodes everywhere on
-/// Apple devices, and is lossless from PCM, so we reroute through it.
+/// ISOBMFF + Apple HLS spec. FLAC and EAC3 are legal, decode
+/// everywhere on Apple devices, so we reroute through one of them.
 ///
-/// Trade-off: the EAC3-with-Atmos-JOC stream-copy path preserves the
-/// JOC metadata for Atmos-capable receivers, but this bridge produces
-/// 5.1 / 7.1 PCM-derived FLAC, losing the spatial mix. Caller decides
-/// whether to bridge eagerly (TrueHD / DTS, which have no other
-/// option) or lazy after a stream-copy attempt (EAC3, where we want
-/// to keep Atmos when the muxer accepts it).
+/// Atmos object metadata cannot be preserved through either bridge
+/// mode: TrueHD-MAT objects are interleaved in the source bitstream,
+/// FFmpeg's EAC3 encoder doesn't produce JOC (the Dolby-licensed
+/// extension that encodes Atmos in EAC3), and FLAC has no object
+/// channel concept. EAC3+JOC sources are kept lossless via the
+/// stream-copy path that bypasses the bridge entirely; only sources
+/// that can't stream-copy enter this bridge.
+/// Encoder choice for the audio bridge. Public so `LoadOptions` and
+/// the host can pass it through; default `.surroundCompat` because
+/// the soundbar / LPCM-stereo-only install base is the majority of
+/// the consumer market.
+///
+/// - `.surroundCompat`: EAC3 5.1 at 384 kbps, AVPlayer → HDMI
+///   bitstream tunnel. Lossy but surround works on essentially every
+///   modern AVR + soundbar.
+/// - `.lossless`: FLAC up to 7.1, AVPlayer → LPCM HDMI route. Needs
+///   a sink that accepts multichannel LPCM (Denon / Marantz / NAD).
+public enum AudioBridgeMode: String, Sendable, CaseIterable {
+    case surroundCompat
+    case lossless
+}
+
 final class AudioBridge: @unchecked Sendable {
+
+    // MARK: - Mode
+
+    typealias Mode = AudioBridgeMode
 
     // MARK: - Errors
 
@@ -52,9 +82,9 @@ final class AudioBridge: @unchecked Sendable {
             case .decoderAllocFailed:            return "AudioBridge: avcodec_alloc_context3 (decoder) failed"
             case .decoderParametersFailed(let c): return "AudioBridge: avcodec_parameters_to_context returned \(c)"
             case .decoderOpenFailed(let c):      return "AudioBridge: source decoder open failed (\(c))"
-            case .encoderNotFound:               return "AudioBridge: FLAC encoder not registered (FFmpeg build missing --enable-encoder=flac?)"
-            case .encoderAllocFailed:            return "AudioBridge: avcodec_alloc_context3 (FLAC encoder) failed"
-            case .encoderOpenFailed(let c):      return "AudioBridge: FLAC encoder open failed (\(c))"
+            case .encoderNotFound:               return "AudioBridge: bridge encoder not registered (FFmpeg build missing --enable-encoder=flac / --enable-encoder=eac3?)"
+            case .encoderAllocFailed:            return "AudioBridge: avcodec_alloc_context3 (encoder) failed"
+            case .encoderOpenFailed(let c):      return "AudioBridge: encoder open failed (\(c))"
             case .codecparAllocFailed:           return "AudioBridge: avcodec_parameters_alloc failed"
             case .resamplerAllocFailed(let c):   return "AudioBridge: swr_alloc_set_opts2 returned \(c)"
             case .resamplerInitFailed(let c):    return "AudioBridge: swr_init returned \(c)"
@@ -103,6 +133,7 @@ final class AudioBridge: @unchecked Sendable {
     private(set) var encoderTimeBase: AVRational = AVRational(num: 1, den: 1)
 
     private let srcTimeBase: AVRational
+    private let mode: Mode
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
     /// PTS counter for the encoder, in encoder time base. Incremented
@@ -122,23 +153,33 @@ final class AudioBridge: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    /// Opens the source decoder + FLAC encoder. Encoder is opened
-    /// eagerly using `srcCodecpar.sample_rate` and `ch_layout` so the
-    /// resulting `encoderCodecpar` is available immediately for muxer
-    /// init. If the source's codecpar is incomplete (TrueHD sometimes
-    /// reports `sample_rate=0` until the first frame), we fall back to
-    /// 48 kHz stereo, which the resampler will reconfigure on the
-    /// first decoded frame if it differs.
-    init(srcCodecpar: UnsafeMutablePointer<AVCodecParameters>, srcTimeBase: AVRational) throws {
+    /// Opens the source decoder + bridge encoder. The encoder choice
+    /// is picked by `mode`:
+    ///   - `.surroundCompat`: EAC3 5.1 at 384 kbps via FFmpeg's eac3
+    ///     encoder. Caps channels at 6, sample format FLTP.
+    ///   - `.lossless`: FLAC at source channel count via FFmpeg's flac
+    ///     encoder. Caps at 8 channels (FLAC max), sample format S16
+    ///     for lossy sources or S32@24 for lossless sources.
+    /// Encoder is opened eagerly so `encoderCodecpar` is available
+    /// immediately for muxer init. If the source's codecpar is
+    /// incomplete (TrueHD sometimes reports `sample_rate=0` until the
+    /// first frame), we fall back to 48 kHz stereo, which the resampler
+    /// will reconfigure on the first decoded frame if it differs.
+    init(
+        srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
+        srcTimeBase: AVRational,
+        mode: Mode = .surroundCompat
+    ) throws {
         self.srcTimeBase = srcTimeBase
+        self.mode = mode
 
         // 1. Source decoder
         let srcCodecID = srcCodecpar.pointee.codec_id
 
-        // Pick the PCM intermediate format. Lossless source codecs
-        // get S32+24 to preserve their bit depth through the bridge;
-        // lossy ones use S16 because 16-bit is plenty for content
-        // that's already been perceptually compressed.
+        // PCM intermediate format. The encoder mode dictates this:
+        //   - EAC3 needs FLTP (float planar) regardless of source.
+        //   - FLAC takes S16 or S32; lossless sources get S32+24 to
+        //     preserve bit depth, lossy sources stay at S16.
         let isLosslessSource: Bool
         switch srcCodecID {
         case AV_CODEC_ID_TRUEHD,
@@ -154,14 +195,21 @@ final class AudioBridge: @unchecked Sendable {
         default:
             isLosslessSource = false
         }
-        if isLosslessSource {
-            pcmSampleFmt = AV_SAMPLE_FMT_S32
+        switch mode {
+        case .surroundCompat:
+            pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
-            pcmBitsPerRawSample = 24
-        } else {
-            pcmSampleFmt = AV_SAMPLE_FMT_S16
-            pcmBytesPerSample = 2
-            pcmBitsPerRawSample = 16
+            pcmBitsPerRawSample = 32
+        case .lossless:
+            if isLosslessSource {
+                pcmSampleFmt = AV_SAMPLE_FMT_S32
+                pcmBytesPerSample = 4
+                pcmBitsPerRawSample = 24
+            } else {
+                pcmSampleFmt = AV_SAMPLE_FMT_S16
+                pcmBytesPerSample = 2
+                pcmBitsPerRawSample = 16
+            }
         }
         guard let srcCodec = avcodec_find_decoder(srcCodecID) else {
             throw AudioBridgeError.decoderNotFound(codecID: srcCodecID.rawValue)
@@ -181,17 +229,27 @@ final class AudioBridge: @unchecked Sendable {
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
         }
 
-        // 2. FLAC encoder. We pull the requested sample rate / channel
-        //    layout from the source codecpar (with safe defaults), and
-        //    fix the encoder's input sample format at S16 because FLAC
-        //    accepts only S16 / S32 and S16 is enough for AVPlayer's
-        //    audio decode path. `bit_rate=0` is the FLAC encoder's
-        //    "no rate cap" signal (FLAC is variable-bitrate / lossless).
-        guard let flacCodec = avcodec_find_encoder(AV_CODEC_ID_FLAC) else {
+        // 2. Bridge encoder. Selected by mode:
+        //   - .surroundCompat → AV_CODEC_ID_EAC3, 384 kbps, max 6 ch
+        //   - .lossless       → AV_CODEC_ID_FLAC, VBR, max 8 ch
+        let encoderCodecID: AVCodecID
+        let maxEncodedChannels: Int32
+        let encoderBitRate: Int64
+        switch mode {
+        case .surroundCompat:
+            encoderCodecID = AV_CODEC_ID_EAC3
+            maxEncodedChannels = 6
+            encoderBitRate = 384_000
+        case .lossless:
+            encoderCodecID = AV_CODEC_ID_FLAC
+            maxEncodedChannels = 8
+            encoderBitRate = 0
+        }
+        guard let encCodec = avcodec_find_encoder(encoderCodecID) else {
             cleanup()
             throw AudioBridgeError.encoderNotFound
         }
-        guard let enc = avcodec_alloc_context3(flacCodec) else {
+        guard let enc = avcodec_alloc_context3(encCodec) else {
             cleanup()
             throw AudioBridgeError.encoderAllocFailed
         }
@@ -240,18 +298,26 @@ final class AudioBridge: @unchecked Sendable {
                 category: .session
             )
         }
+        // Cap to the encoder's max channel count. EAC3 stops at 5.1
+        // (mode .surroundCompat), FLAC at 7.1 (mode .lossless).
+        // Downmix from above the cap happens automatically inside
+        // swr_convert when the source channel layout exceeds the
+        // encoder's; the resampler picks Apple-compatible layout
+        // ordering.
+        let nChannels: Int32 = min(resolvedChannels, maxEncodedChannels)
         EngineLog.emit(
-            "[AudioBridge] init: codec=\(srcCodecID.rawValue) "
-            + "sampleRate=\(sampleRate) channels=\(resolvedChannels) "
+            "[AudioBridge] init: mode=\(mode.rawValue) "
+            + "srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate) "
+            + "sourceChannels=\(resolvedChannels) "
+            + "encoderChannels=\(nChannels) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
         )
-        let nChannels: Int32 = resolvedChannels
 
         enc.pointee.sample_rate = sampleRate
         enc.pointee.sample_fmt = pcmSampleFmt
         enc.pointee.bits_per_raw_sample = pcmBitsPerRawSample
-        enc.pointee.bit_rate = 0
+        enc.pointee.bit_rate = encoderBitRate
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
         var encLayout = AVChannelLayout()
         av_channel_layout_default(&encLayout, nChannels)
@@ -260,7 +326,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: layoutCopyRet)
         }
-        let encOpenRet = avcodec_open2(enc, flacCodec, nil)
+        let encOpenRet = avcodec_open2(enc, encCodec, nil)
         guard encOpenRet >= 0 else {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: encOpenRet)

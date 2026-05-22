@@ -130,13 +130,34 @@ public struct LoadOptions: Sendable, Equatable {
     /// panel-mode switch into HDR; otherwise routes via media.
     public var panelIsInHDRMode: Bool
 
+    /// Audio bridge encoder choice for source codecs that can't
+    /// stream-copy into fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus, and
+    /// EAC3-from-MKV-without-dec3-extradata).
+    ///
+    /// - `.surroundCompat` (default): EAC3 5.1 at 384 kbps. AVPlayer
+    ///   hands the encoded bitstream to HDMI; the sink decodes its
+    ///   own 5.1 mix. Works on soundbars (Sonos Arc, Samsung HW-Q,
+    ///   Bose) and AVRs that don't accept multichannel LPCM via HDMI.
+    ///   Lossy; caps 7.1 sources to 5.1.
+    /// - `.lossless`: FLAC up to 7.1 lossless. AVPlayer decodes to
+    ///   LPCM and routes via the active HDMI port. Needs a sink that
+    ///   accepts multichannel LPCM (Denon / Marantz / NAD AVRs).
+    ///   On stereo-LPCM-only routes, multichannel LPCM gets downmixed
+    ///   to stereo before output (silent regression versus EAC3).
+    ///
+    /// Default `.surroundCompat` because the LPCM-multichannel-over-
+    /// HDMI capability needed by the lossless path is rarer than the
+    /// soundbar / basic-AVR install base.
+    public var audioBridgeMode: AudioBridgeMode
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
-        panelIsInHDRMode: Bool = false
+        panelIsInHDRMode: Bool = false,
+        audioBridgeMode: AudioBridgeMode = .surroundCompat
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -144,6 +165,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.audioBridgeMode = audioBridgeMode
     }
 }
 

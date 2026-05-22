@@ -319,7 +319,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
-        initialPositionSeconds: Double? = nil
+        initialPositionSeconds: Double? = nil,
+        audioBridgeMode: AudioBridgeMode = .surroundCompat
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -330,7 +331,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
         self.initialPositionSeconds = initialPositionSeconds
+        self.audioBridgeMode = audioBridgeMode
     }
+
+    /// Encoder choice for the audio bridge (used for source codecs that
+    /// can't stream-copy into fMP4: TrueHD, DTS, DTS-HD MA, MP3, Opus,
+    /// and EAC3-from-MKV-without-dec3-extradata).
+    private let audioBridgeMode: AudioBridgeMode
 
     /// Resume position used to seed the sliding-window playlist so its
     /// initial visible range covers the segment AVPlayer will seek to.
@@ -1331,7 +1338,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             do {
                 let bridge = try AudioBridge(
                     srcCodecpar: audioStream.pointee.codecpar,
-                    srcTimeBase: audioStream.pointee.time_base
+                    srcTimeBase: audioStream.pointee.time_base,
+                    mode: audioBridgeMode
                 )
                 if let cp = bridge.encoderCodecpar {
                     let cfg = HLSSegmentProducer.AudioConfig(
@@ -1346,12 +1354,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     self.audioBridge = bridge
                     do {
                         let prod = try makeProducer(baseIndex: 0)
-                        audioHLSCodecs = "fLaC"
-                        self.audioPipelineDescription = "FLAC bridge ← \(sourceCodecLabel)"
+                        let (hlsCodec, pipelineLabel): (String, String)
+                        switch audioBridgeMode {
+                        case .surroundCompat:
+                            hlsCodec = "ec-3"
+                            pipelineLabel = "EAC3 5.1 bridge ← \(sourceCodecLabel)"
+                        case .lossless:
+                            hlsCodec = "fLaC"
+                            pipelineLabel = "FLAC bridge ← \(sourceCodecLabel)"
+                        }
+                        audioHLSCodecs = hlsCodec
+                        self.audioPipelineDescription = pipelineLabel
                         return prod
                     } catch {
                         EngineLog.emit(
-                            "[HLSVideoEngine] FLAC bridge header write failed (\(error)), falling back to video-only",
+                            "[HLSVideoEngine] \(audioBridgeMode.rawValue) bridge header write failed (\(error)), falling back to video-only",
                             category: .session
                         )
                         self.savedAudioConfig = nil

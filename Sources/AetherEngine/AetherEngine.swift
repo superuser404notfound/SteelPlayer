@@ -625,7 +625,8 @@ public final class AetherEngine: ObservableObject {
                     audioSourceStreamIndex: audioSourceStreamIndex,
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     matchContentEnabled: options.matchContentEnabled,
-                    panelIsInHDRMode: options.panelIsInHDRMode
+                    panelIsInHDRMode: options.panelIsInHDRMode,
+                    audioBridgeMode: options.audioBridgeMode
                 )
                 playbackBackend = .native
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -665,7 +666,8 @@ public final class AetherEngine: ObservableObject {
         audioSourceStreamIndex: Int32? = nil,
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
-        panelIsInHDRMode: Bool = false
+        panelIsInHDRMode: Bool = false,
+        audioBridgeMode: AudioBridgeMode = .surroundCompat
     ) async throws {
         let session = HLSVideoEngine(
             url: url,
@@ -676,7 +678,8 @@ public final class AetherEngine: ObservableObject {
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
-            initialPositionSeconds: startPosition
+            initialPositionSeconds: startPosition,
+            audioBridgeMode: audioBridgeMode
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -1091,7 +1094,8 @@ public final class AetherEngine: ObservableObject {
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
-                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode
+                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
+                    audioBridgeMode: loadedOptions.audioBridgeMode
                 )
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native

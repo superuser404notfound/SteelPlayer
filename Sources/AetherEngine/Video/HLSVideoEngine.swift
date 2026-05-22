@@ -1255,24 +1255,35 @@ public final class HLSVideoEngine: @unchecked Sendable {
             return "audio"
         }()
 
-        if !preferBridge, let cfg = streamCopyAudio {
-            self.savedAudioConfig = cfg
-            do {
-                let prod = try makeProducer(baseIndex: 0)
+        if !preferBridge, let cfg = streamCopyAudio, let vcfg = savedVideoConfig {
+            // Pre-flight the mp4 muxer's write_header to detect cases
+            // the cascade would otherwise miss. makeProducer no longer
+            // exercises avformat_write_header itself — the first muxer
+            // alloc happens lazily inside the producer's pump on the
+            // first keep-packet, well after this scope has returned.
+            // Without the probe a failure there (typical case:
+            // EAC3-from-MKV whose CodecPrivate lacks the dec3 extradata
+            // the mov muxer needs to write the audio track's
+            // sample-entry, returns -22 / "Cannot write moov atom
+            // before EAC3 packets parsed") leaves the producer stuck
+            // and the bridge fallback below never fires.
+            let probeVideo = MP4SegmentMuxer.VideoConfig(
+                codecpar: vcfg.codecpar,
+                timeBase: vcfg.timeBase,
+                codecTagOverride: vcfg.codecTagOverride
+            )
+            let probeAudio = MP4SegmentMuxer.AudioConfig(
+                codecpar: cfg.codecpar,
+                timeBase: cfg.timeBase
+            )
+            let probeRet = MP4SegmentMuxer.probeWriteHeader(
+                video: probeVideo,
+                audio: probeAudio
+            )
+            if probeRet < 0 {
                 if sourceIsAtmos {
                     EngineLog.emit(
-                        "[HLSVideoEngine] EAC3+JOC Atmos: stream-copy engaged, MAT 2.0 passthrough intact",
-                        category: .session
-                    )
-                }
-                self.audioPipelineDescription = sourceIsAtmos
-                    ? "Stream-copy (EAC3+JOC Atmos)"
-                    : "Stream-copy (\(sourceCodecLabel))"
-                return prod
-            } catch {
-                if sourceIsAtmos {
-                    EngineLog.emit(
-                        "[HLSVideoEngine] WARNING: Atmos downgrade — EAC3+JOC stream-copy rejected by mp4 muxer (\(error)). "
+                        "[HLSVideoEngine] WARNING: Atmos downgrade — EAC3+JOC stream-copy probe rejected by mp4 muxer (ret=\(probeRet)). "
                         + "Falling back to FLAC bridge: bed channels stay lossless, but object metadata is lost. "
                         + "Source: \(sourceAudioStream?.pointee.codecpar.pointee.profile.description ?? "?") profile, "
                         + "channels=\(sourceAudioStream?.pointee.codecpar.pointee.ch_layout.nb_channels ?? -1). "
@@ -1281,11 +1292,32 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     )
                 } else {
                     EngineLog.emit(
-                        "[HLSVideoEngine] audio stream-copy header write failed (\(error)), retrying with FLAC bridge",
+                        "[HLSVideoEngine] audio stream-copy probe failed (ret=\(probeRet)), retrying with FLAC bridge",
                         category: .session
                     )
                 }
                 // Fall through to bridge attempt.
+            } else {
+                self.savedAudioConfig = cfg
+                do {
+                    let prod = try makeProducer(baseIndex: 0)
+                    if sourceIsAtmos {
+                        EngineLog.emit(
+                            "[HLSVideoEngine] EAC3+JOC Atmos: stream-copy engaged, MAT 2.0 passthrough intact",
+                            category: .session
+                        )
+                    }
+                    self.audioPipelineDescription = sourceIsAtmos
+                        ? "Stream-copy (EAC3+JOC Atmos)"
+                        : "Stream-copy (\(sourceCodecLabel))"
+                    return prod
+                } catch {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] makeProducer failed after stream-copy probe succeeded (\(error)), retrying with FLAC bridge",
+                        category: .session
+                    )
+                    // Fall through to bridge attempt.
+                }
             }
         } else if preferBridge && sourceIsAtmos {
             // Caller pre-decided bridge before reaching here. For Atmos

@@ -340,6 +340,87 @@ final class MP4SegmentMuxer {
         return Int(cur - base)
     }
 
+    // MARK: - Eager probe
+
+    /// Dry-run the `avformat_write_header` path with the given codec
+    /// configuration to detect mux failures the engine's audio cascade
+    /// would otherwise miss. Returns 0 on success or a libavformat
+    /// negative error code.
+    ///
+    /// Background: in the current architecture the real muxer is
+    /// allocated lazily inside the producer's pump on the first
+    /// keep-packet, well after `HLSVideoEngine.buildProducerWithAudioCascade`
+    /// has returned its producer. If `avformat_write_header` would
+    /// fail (typical case: EAC3-from-MKV without `dec3` extradata,
+    /// for which the mp4 muxer returns -22 / "Cannot write moov atom
+    /// before EAC3 packets parsed"), the cascade never sees the error
+    /// and never falls back to the FLAC bridge. The session dies
+    /// before the first segment.
+    ///
+    /// This probe runs the same `avformat_alloc_output_context2` →
+    /// add streams → `avformat_write_header` sequence with the same
+    /// movflags, but routes the bytes to a discarded in-memory AVIO
+    /// buffer. No filesystem side effects, no segment files, no
+    /// long-lived state.
+    static func probeWriteHeader(
+        video: VideoConfig,
+        audio: AudioConfig?
+    ) -> Int32 {
+        var ctxOut: UnsafeMutablePointer<AVFormatContext>?
+        let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "probe.m4s")
+        guard allocRet == 0, let ctx = ctxOut else {
+            return allocRet
+        }
+        defer { avformat_free_context(ctx) }
+
+        ctx.pointee.strict_std_compliance = -2
+
+        // In-memory AVIO sink. avio_open_dyn_buf returns a context
+        // whose write callback appends to an internal buffer; we
+        // discard the buffer at the end so no bytes survive the probe.
+        var pb: UnsafeMutablePointer<AVIOContext>?
+        let avioRet = avio_open_dyn_buf(&pb)
+        guard avioRet >= 0, let pbCtx = pb else {
+            return avioRet
+        }
+        ctx.pointee.pb = pbCtx
+        defer {
+            var bufPtr: UnsafeMutablePointer<UInt8>?
+            _ = avio_close_dyn_buf(pbCtx, &bufPtr)
+            if bufPtr != nil {
+                av_free(bufPtr)
+            }
+        }
+
+        // Video stream.
+        guard let videoStream = avformat_new_stream(ctx, nil) else {
+            return -1
+        }
+        let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
+        guard vCopy >= 0 else { return vCopy }
+        videoStream.pointee.time_base = video.timeBase
+        if let override = video.codecTagOverride,
+           let tag = Self.mkTag(fromFourCC: override) {
+            videoStream.pointee.codecpar.pointee.codec_tag = tag
+        }
+
+        // Audio stream (optional).
+        if let audio = audio {
+            guard let audioStream = avformat_new_stream(ctx, nil) else {
+                return -1
+            }
+            let aCopy = avcodec_parameters_copy(audioStream.pointee.codecpar, audio.codecpar)
+            guard aCopy >= 0 else { return aCopy }
+            audioStream.pointee.time_base = audio.timeBase
+        }
+
+        var opts: OpaquePointer? = nil
+        defer { av_dict_free(&opts) }
+        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom", 0)
+
+        return avformat_write_header(ctx, &opts)
+    }
+
     // MARK: - Pump-side API
 
     /// Write one packet via av_interleaved_write_frame. Caller has

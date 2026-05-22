@@ -101,12 +101,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     // MARK: - State
 
-    /// The source demuxer the pump reads packets from. `var` (not
-    /// `let`) so the engine's periodic-recycle path can swap a fresh
-    /// Demuxer in mid-pump — see `requestPauseForRecycle()` and
-    /// `resumePumpWithDemuxer(_:)`. The swap only happens while the
-    /// pump is parked on `pauseCondition`, so no read race.
-    private var demuxer: Demuxer
+    /// The source demuxer the pump reads packets from. Owned by this
+    /// producer for the session's lifetime.
+    private let demuxer: Demuxer
     private let videoStreamIndex: Int32
     private let videoOutputStreamIndex: Int32 = 0
     private let cache: SegmentCache
@@ -207,29 +204,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// pending packet is flushed using `*FallbackDurationPts`.
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
-
-    /// Demuxer-recycle synchronisation. The engine signals
-    /// `pauseRequested=true` via `requestPauseForRecycle()`; the pump
-    /// notices at the next fragment-cut boundary, drops its
-    /// look-behind packets, sets `pausedAtSegment` to the just-cut
-    /// segment index, broadcasts, and parks on `pauseCondition`. The
-    /// engine then swaps the demuxer via `resumePumpWithDemuxer(_:)`
-    /// which clears `pauseRequested`, signs the new Demuxer in, and
-    /// broadcasts so the pump wakes up reading from it.
-    ///
-    /// Dropping the look-behind packets at pause means the new
-    /// demuxer's first packets stand in for them — the new demuxer
-    /// seeks to `expectedRestartPts` (the just-cut segment's start
-    /// PTS in source TB), so its first video packet is the keyframe
-    /// at that boundary, identical to the one we dropped. Dedup
-    /// against `expectedRestartPts` (video) and `lastAudioSourceDts`
-    /// (audio) handles matroska seek's "lands at cluster start"
-    /// behaviour where the demuxer can emit packets earlier than the
-    /// keyframe target.
-    private let pauseCondition = NSCondition()
-    private var pauseRequested: Bool = false
-    private var pausedAtSegment: Int? = nil
-    private var expectedRestartPts: Int64 = Int64.min
 
     private var loggedFirstVideoPktInfo = false
     /// One-shot log latches for the monotonic-dts repair. Bumps and
@@ -682,14 +656,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         shouldStop = true
         stateLock.unlock()
         cache.wakeWaiters()
-        // Wake any pump that's parked on pauseCondition waiting for a
-        // demuxer recycle resume. Without this signal, a stop() that
-        // arrives mid-pause would leave the pump blocked indefinitely
-        // because the engine's recycle path would no longer run
-        // resumePumpWithDemuxer().
-        pauseCondition.lock()
-        pauseCondition.broadcast()
-        pauseCondition.unlock()
     }
 
     /// Thread-safe read of `shouldStop`. Used by the dispatchSinkOutput
@@ -717,75 +683,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return true
     }
 
-    // MARK: - Demuxer recycle (partial restart, mp4 muxer + bridge stay alive)
-
-    /// Engine-called: signal the pump to pause at the next fragment-cut
-    /// boundary so the engine can swap in a fresh demuxer. Releases the
-    /// pump's pendingVideoPkt / pendingAudioPkt look-behind packets
-    /// (the new demuxer's first packets stand in for them via the
-    /// post-resume dedup in the pump). Returns immediately; use
-    /// `waitForPumpPause(timeout:)` to block until the pump is parked.
-    func requestPauseForRecycle() {
-        pauseCondition.lock()
-        pauseRequested = true
-        pauseCondition.broadcast()
-        pauseCondition.unlock()
-    }
-
-    /// Engine-called: block until the pump has reached a fragment-cut
-    /// boundary, freed its look-behind, and parked on `pauseCondition`.
-    /// Returns the absolute segment index the pump is paused at (= the
-    /// muxer's `currentSegmentIndex`, which is the segment the muxer
-    /// is now waiting to receive content for). Returns nil on timeout
-    /// or if the pump has stopped before reaching a pause point.
-    func waitForPumpPause(timeout: TimeInterval) -> Int? {
-        pauseCondition.lock()
-        defer { pauseCondition.unlock() }
-        let deadline = Date().addingTimeInterval(timeout)
-        while pausedAtSegment == nil {
-            if checkShouldStop() { return nil }
-            if !pauseCondition.wait(until: deadline) { return nil }
-        }
-        return pausedAtSegment
-    }
-
-    /// Engine-called: install a fresh demuxer (seeked to the paused
-    /// segment's startPts) and signal the pump to resume. The pump's
-    /// dedup logic on resume drops any packets from the new demuxer
-    /// with PTS before `expectedRestartPts` (video) or with PTS &le;
-    /// `lastAudioSourceDts` (audio), then continues writing packets
-    /// into the SAME mp4Muxer that survived the recycle.
-    func resumePumpWithDemuxer(_ newDemuxer: Demuxer) {
-        pauseCondition.lock()
-        // Apply the same stream-discard filter the producer's init
-        // path applies. Without this, the matroska demuxer parses +
-        // queues every subtitle / non-active audio block, exactly
-        // the per-packet allocation churn the recycle is supposed to
-        // bound.
-        var keep: Set<Int32> = [videoStreamIndex]
-        if let audio = audioConfig {
-            keep.insert(audio.sourceStreamIndex)
-        }
-        newDemuxer.discardAllStreamsExcept(keep)
-
-        self.demuxer = newDemuxer
-        self.pauseRequested = false
-        self.pausedAtSegment = nil
-        pauseCondition.broadcast()
-        pauseCondition.unlock()
-    }
-
     // MARK: - Pump
 
     private func runPumpLoop() {
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
         let lastError: Int32 = 0
-
-        // Track muxer segment index across iterations. When it
-        // advances, we just finished a fragment cut — the safe spot
-        // to honour a pending recycle pause request.
-        var muxerIdxAtLoopStart = currentMuxerSegmentIndex
 
         do {
             readLoop: while true {
@@ -794,76 +697,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 stateLock.unlock()
                 if stopRequested { break readLoop }
 
-                // Check for pending recycle pause request right at the
-                // top of each iteration. Two conditions must hold:
-                //   1. The mp4 muxer just cut a fragment in the
-                //      previous iteration (currentMuxerSegmentIndex
-                //      advanced past muxerIdxAtLoopStart). This is
-                //      the only safe spot — mid-fragment the muxer's
-                //      mdat_buf holds in-flight content that can't
-                //      be left dangling across a demuxer recycle.
-                //   2. The engine asked for a pause (pauseRequested).
-                if currentMuxerSegmentIndex != muxerIdxAtLoopStart
-                   && currentMuxerSegmentIndex != .min {
-                    pauseCondition.lock()
-                    if pauseRequested {
-                        // Drop look-behind packets — the new demuxer
-                        // (seeked to plan[currentMuxerSegmentIndex].startPts)
-                        // will re-emit equivalent ones on resume, and
-                        // the dedup logic on the read side handles
-                        // the matroska-seek-lands-at-cluster-start
-                        // case where a few packets before the target
-                        // PTS may appear first.
-                        if let prev = pendingVideoPkt {
-                            var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            trackedPacketFree(&pkt)
-                            pendingVideoPkt = nil
-                        }
-                        if let prev = pendingAudioPkt {
-                            var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            trackedPacketFree(&pkt)
-                            pendingAudioPkt = nil
-                        }
-
-                        // Set the dedup threshold for the read side:
-                        // the just-cut segment's startPts in source
-                        // video TB. New demuxer's first video packet
-                        // is the keyframe at this PTS exactly; first
-                        // audio packets may be slightly earlier (cluster
-                        // alignment) and get dropped until we cross
-                        // lastAudioSourceDts.
-                        let segPlanIdx = currentMuxerSegmentIndex - baseIndex
-                        if segPlanIdx >= 0 && segPlanIdx < segmentBoundaries.count {
-                            expectedRestartPts = segmentBoundaries[segPlanIdx]
-                        }
-                        pausedAtSegment = currentMuxerSegmentIndex
-
-                        EngineLog.emit(
-                            "[HLSSegmentProducer] paused for demuxer recycle at seg=\(currentMuxerSegmentIndex) restartPts=\(expectedRestartPts) lastVideoDts=\(lastVideoSourceDts) lastAudioDts=\(lastAudioSourceDts)",
-                            category: .session
-                        )
-                        pauseCondition.broadcast()
-
-                        // Park until the engine swaps the demuxer +
-                        // clears pauseRequested. shouldStop unblocks
-                        // the wait via the wakeWaiters path on stop().
-                        while pauseRequested {
-                            if checkShouldStop() {
-                                pauseCondition.unlock()
-                                break readLoop
-                            }
-                            pauseCondition.wait()
-                        }
-
-                        EngineLog.emit(
-                            "[HLSSegmentProducer] resumed after demuxer recycle, dedup video<\(expectedRestartPts) audio<=\(lastAudioSourceDts)",
-                            category: .session
-                        )
-                    }
-                    pauseCondition.unlock()
-                }
-                muxerIdxAtLoopStart = currentMuxerSegmentIndex
-
                 guard let packet = try demuxer.readPacket() else {
                     // EOF
                     break readLoop
@@ -871,34 +704,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 packetsRead += 1
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
                 defer { trackedPacketFree(&pktPtr) }
-
-                // Recycle-dedup: drop packets the old demuxer already
-                // pumped. Video drops while pkt.pts < expectedRestartPts
-                // (matroska seek may emit cluster-start packets before
-                // the keyframe target). Audio drops while pkt.pts <=
-                // lastAudioSourceDts (we already consumed those samples
-                // into the FLAC bridge's FIFO; re-feeding would double
-                // the PCM content). First accepted packet on each
-                // stream clears that stream's dedup contribution.
-                if expectedRestartPts != Int64.min {
-                    let isV = (packet.pointee.stream_index == videoStreamIndex)
-                    let isA = (audioConfig.map { packet.pointee.stream_index == $0.sourceStreamIndex }) ?? false
-                    if isV {
-                        if packet.pointee.pts < expectedRestartPts {
-                            continue  // av_packet_free in defer
-                        }
-                        // Video crossed the boundary, clear video dedup.
-                        // Audio dedup against lastAudioSourceDts may
-                        // still be active for one more iteration; that's
-                        // fine, it self-clears on first audio accept.
-                        expectedRestartPts = Int64.min
-                    } else if isA {
-                        if packet.pointee.pts <= lastAudioSourceDts {
-                            continue
-                        }
-                        // Audio crossed, fall through.
-                    }
-                }
 
                 // Drop any AVPacket side data the demuxer attached
                 // (matroska's BlockAddition path allocates side data

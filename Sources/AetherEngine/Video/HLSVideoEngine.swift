@@ -212,18 +212,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var server: HLSLocalServer?
     private var provider: VideoSegmentProvider?
 
-    /// Detached Task that periodically recycles ONLY the source demuxer
-    /// + its AVIOReader (frees matroska state + URLSession dispatch_data
-    /// retention). The mp4 muxer + audio bridge stay alive across the
-    /// recycle so segment output is byte-continuous from AVPlayer's
-    /// perspective — no perceived discontinuity, no buffer refill,
-    /// no fast-forward / jump glitch the full-producer-restart attempt
-    /// in 833a1b5 had. Driven by DrHurt's "remux 120s, terminate,
-    /// repeat" pattern on AetherEngine#4, refined to demuxer-only
-    /// teardown after observing the byte-difference in muxer output
-    /// across producer instances.
-    private var periodicRecycleTask: Task<Void, Never>?
-
     /// Captured at `start()` so the restart path can spin up a fresh
     /// producer at any segment index without re-running the full
     /// DV-classification / codec-pick logic.
@@ -884,17 +872,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    requested index lands.
         prod.start()
 
-        // 8b. Periodic demuxer-only recycle. Tears down + recreates
-        //     ONLY the source-side Demuxer (matroska + AVIOReader +
-        //     URLSession) every ~120 s. The mp4 muxer and FLAC
-        //     bridge stay alive so AVPlayer sees byte-continuous
-        //     output across the recycle (the full-producer restart
-        //     in 833a1b5 caused a visible jump because each new mp4
-        //     muxer instance produced byte-different segments for
-        //     the same source content). Bounded by playback
-        //     duration; cancelled by stop().
-        startPeriodicDemuxerRecycle(totalSegments: plan.count)
-
         // Pick the URL handed to AVPlayer.
         //
         // The decision is driven by the active panel's dynamic-range
@@ -1059,9 +1036,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     public func stop() {
-        periodicRecycleTask?.cancel()
-        periodicRecycleTask = nil
-
         restartLock.lock()
         producer?.stop()
         let p = producer
@@ -1377,144 +1351,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioHLSCodecs = nil
         self.audioPipelineDescription = nil
         return try makeProducer(baseIndex: 0)
-    }
-
-    /// Wall-clock cadence of the periodic demuxer recycle. 120 s lines
-    /// up with DrHurt's "remux 120s, terminate, repeat" suggestion in
-    /// AetherEngine#4, and is short enough that the libavformat
-    /// matroska state + AVIOReader/URLSession churn don't accumulate
-    /// to a jetsam-relevant resident set on long-form 4K HDR HEVC.
-    ///
-    /// DIAGNOSTIC: temporarily disabled (24 h interval, effectively
-    /// never fires for any realistic playback). The 64 MB chunk +
-    /// close-cleanup + prefetch-race fixes did not reduce the long-form
-    /// leak. The next hypothesis to falsify: does the leak come from
-    /// the recycle teardown itself (libavformat / AVIOReader state not
-    /// fully released across the swap), or does it persist during
-    /// steady-state pumping with no recycles at all? If the leak goes
-    /// away here, recycle is the source and we need to fix or remove
-    /// it. If the leak remains, the source is in the steady-state pump
-    /// (URLSession completion-handler retention etc.).
-    private static let demuxerRecycleIntervalSeconds: UInt64 = 86400
-
-    /// Time budget for the pump to reach a fragment-cut boundary
-    /// after the recycle request lands. Generous; in practice the
-    /// pump cuts every ~4 s, so 10 s gives ~2× safety margin.
-    private static let demuxerRecyclePauseTimeoutSeconds: TimeInterval = 10.0
-
-    /// Spawn the demuxer-recycle Task. Detached + weak-self so the
-    /// session can be torn down independently of the Task's lifetime.
-    /// Loop self-cancels via Task.isCancelled checks at each boundary
-    /// so `stop()` brings the task down with one cancel call.
-    ///
-    /// On each cycle: wait the interval, ask the producer to pause
-    /// at the next segment boundary, wait for pause confirmation,
-    /// then under restartLock close the old demuxer, open a fresh
-    /// one seeked to the paused segment's startPts, and hand it
-    /// back to the producer. The producer's dedup logic on resume
-    /// drops any redundant first packets the new demuxer emits
-    /// before its first packet at-or-past the keyframe target.
-    private func startPeriodicDemuxerRecycle(totalSegments: Int) {
-        periodicRecycleTask?.cancel()
-        periodicRecycleTask = Task.detached(priority: .utility) { [weak self] in
-            let interval = Self.demuxerRecycleIntervalSeconds
-            let pauseTimeout = Self.demuxerRecyclePauseTimeoutSeconds
-
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(nanoseconds: interval * 1_000_000_000)
-                } catch {
-                    return
-                }
-                guard let self = self, !Task.isCancelled else { return }
-                self.performDemuxerRecycle(pauseTimeout: pauseTimeout,
-                                           totalSegments: totalSegments)
-            }
-        }
-    }
-
-    /// Execute one demuxer-recycle cycle. Serialised against scrub-
-    /// restart via restartLock — both paths swap `self.demuxer`, so
-    /// they must not interleave. Returns early on any failure; the
-    /// caller's loop retries on the next interval.
-    private func performDemuxerRecycle(pauseTimeout: TimeInterval,
-                                        totalSegments: Int) {
-        // Take the restartLock so scrub-restart can't race the
-        // demuxer swap. Held for the entire close → open → handoff
-        // sequence.
-        restartLock.lock()
-        defer { restartLock.unlock() }
-
-        guard let producer = self.producer, let oldDem = self.demuxer else {
-            return
-        }
-
-        // Phase 1: ask the pump to pause at the next fragment-cut
-        // boundary and wait for confirmation.
-        producer.requestPauseForRecycle()
-        guard let pausedSegIdx = producer.waitForPumpPause(timeout: pauseTimeout) else {
-            EngineLog.emit(
-                "[HLSVideoEngine] demuxer recycle: pump didn't pause within \(pauseTimeout)s, skipping cycle",
-                category: .session
-            )
-            // Pump might still be paused now if it just missed the
-            // timeout but we don't have a confirmed segment index.
-            // Best-effort resume with the OLD demuxer so the pump
-            // doesn't deadlock waiting indefinitely.
-            producer.resumePumpWithDemuxer(oldDem)
-            return
-        }
-
-        // Phase 2: skip if we're near end-of-file. Recycling the
-        // last few segments isn't worth the cost; we'd be racing the
-        // pump's natural EOF.
-        guard pausedSegIdx >= 0, pausedSegIdx < totalSegments - 2 else {
-            producer.resumePumpWithDemuxer(oldDem)
-            return
-        }
-
-        // Phase 3: compute the target source-time for the new demuxer
-        // seek. The paused segment is the one the mp4 muxer is now
-        // waiting to receive content for, so its startPts in source
-        // video TB is exactly where we want the new demuxer's cursor.
-        guard pausedSegIdx < segmentPlan.count else {
-            producer.resumePumpWithDemuxer(oldDem)
-            return
-        }
-        let absoluteTargetPts = segmentPlan[pausedSegIdx].startPts
-        let videoTb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-        let absoluteTargetSeconds = Double(absoluteTargetPts) * Double(videoTb.num) / Double(videoTb.den)
-
-        // Phase 4: open the new demuxer + seek BEFORE closing the
-        // old one, so a failure path leaves the old one usable for
-        // a resume-with-old recovery.
-        let newDem = Demuxer()
-        do {
-            try newDem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders)
-        } catch {
-            EngineLog.emit(
-                "[HLSVideoEngine] demuxer recycle: open failed (\(error)), resuming with old demuxer",
-                category: .session
-            )
-            producer.resumePumpWithDemuxer(oldDem)
-            return
-        }
-        newDem.seek(to: absoluteTargetSeconds)
-
-        // Phase 5: close the old demuxer (this is where libavformat
-        // matroska state + AVIOReader URLSession state actually get
-        // released).
-        oldDem.close()
-        self.demuxer = newDem
-
-        // Phase 6: hand the new demuxer to the producer and unblock
-        // the pump.
-        producer.resumePumpWithDemuxer(newDem)
-
-        EngineLog.emit(
-            "[HLSVideoEngine] demuxer recycle: swapped at seg=\(pausedSegIdx) (sourcePts=\(absoluteTargetPts), \(String(format: "%.2f", absoluteTargetSeconds))s)",
-            category: .session
-        )
     }
 
     /// Tear down the current producer, seek the demuxer to the start

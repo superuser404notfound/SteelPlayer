@@ -74,16 +74,28 @@ final class AVIOReader: @unchecked Sendable {
 
     // MARK: - Seekable Mode (Range requests)
 
-    /// Settled chunk size: 8 MB.
+    /// Settled chunk size: 4 MB (PROBE).
     ///
-    /// Field-validated 2026-05-22: paired with the delegate-based
-    /// incremental fetch path (long-lived `chunkSession` + per-task
-    /// `ChunkFetchDelegate`), 8 MB chunks plateau mallocMB at
-    /// 103-139 MB through a 5-min Harry Potter 4K HDR run with a
-    /// mid-session scrub. Compared to the historic 64 MB config that
-    /// oscillated 211-291 MB, the new path is both bounded AND lower
-    /// steady-state, while delivering ~1 s cold-start instead of
-    /// ~10 s.
+    /// Lowered 2026-05-22 from 8 MB to push cold-start latency down
+    /// from ~1.4 s to ~0.7 s on 45 Mbps 4K HEVC. The delegate-based
+    /// fetch path (`chunkSession` + `ChunkFetchDelegate`) handles
+    /// arbitrary frequency without invalidation backlog, so the leak
+    /// risk that drove the 8 MB → 64 MB revert (10dbf76) under the
+    /// completion-handler pattern doesn't apply here. Field
+    /// validation pending; if mallocMB stays bounded under a 5+ min
+    /// run, this sticks. Otherwise revert to 8 MB.
+    ///
+    /// Why not even smaller (2 MB / 1 MB): diminishing returns on
+    /// cold-start (sub-0.5 s gains) versus rising HTTP roundtrip
+    /// overhead (5+ ops/sec on remote CDN starts to add up to
+    /// 50-275 ms/sec of server-side processing time per second of
+    /// playback).
+    ///
+    /// Field-validated history at 8 MB (the previous shipped value):
+    /// mallocMB plateaus 103-139 MB through a 5-min Harry Potter 4K
+    /// HDR run with mid-session scrub. avioFetched climbed linearly
+    /// to 2144 MB as expected. Reference for the safe baseline if
+    /// 4 MB needs reverting.
     ///
     /// Why the previous 8 MB attempt (e327e5e) leaked at 6 MB/sec
     /// where this one doesn't: the old path used per-request
@@ -152,7 +164,7 @@ final class AVIOReader: @unchecked Sendable {
     ///     would need re-validating that force-copy makes the pool
     ///     drop bytes promptly enough.
     ///   - Bounded pool of N reusable URLSessions, round-robin.
-    private static let chunkSize = 8 * 1024 * 1024  // 8 MB per chunk
+    private static let chunkSize = 4 * 1024 * 1024  // 4 MB per chunk (probe)
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
 

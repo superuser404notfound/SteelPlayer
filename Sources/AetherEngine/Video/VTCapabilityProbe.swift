@@ -38,7 +38,7 @@ enum VTCapabilityProbe {
     ///   Apple TV chips) → `false` → AV1 routes through
     ///   `SoftwarePlaybackHost`'s dav1d pipeline.
     static let av1Available: Bool = {
-        if #available(tvOS 26.2, iOS 19.0, macOS 16.0, *) {
+        if #available(tvOS 26.2, iOS 26.2, macOS 16.0, *) {
             VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
         }
         if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {

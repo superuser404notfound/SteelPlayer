@@ -1036,28 +1036,50 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     public func stop() {
+        // Snapshot every resource into locals under the lock so we can
+        // (a) clear the instance state immediately and (b) hand the
+        // resources to a detached cleanup task that doesn't capture
+        // self. Per Delarkz's AetherEngine#10, SwiftUI releases its
+        // @State engine reference on the main thread; without the
+        // detach the dismiss path would freeze the host UI for up to
+        // 3 seconds while the producer's pump (potentially parked
+        // inside demuxer.readPacket waiting on an HTTP byte-range
+        // read) finishes exiting.
         restartLock.lock()
-        producer?.stop()
         let p = producer
         producer = nil
-        restartLock.unlock()
-        // Wait outside the lock so deinit on the producer (which may
-        // touch the engine via weakly-captured closures) doesn't
-        // re-enter restartLock.
-        _ = p?.waitForFinish(timeout: 3.0)
-
-        server?.stop()
-        cache?.close()
-        audioBridge?.close()
-        provider = nil
+        let s = server
         server = nil
+        let c = cache
         cache = nil
+        let ab = audioBridge
+        audioBridge = nil
+        let d = demuxer
+        demuxer = nil
+        provider = nil
         savedVideoConfig = nil
         savedAudioConfig = nil
-        audioBridge = nil
         segmentPlan = []
-        demuxer?.close()
-        demuxer = nil
+        restartLock.unlock()
+
+        // Send the cancel signal synchronously so the pump starts
+        // unwinding immediately. waitForFinish + the rest of the
+        // resource teardown move to a detached task.
+        p?.stop()
+
+        // Detached cleanup. The closure captures the local resource
+        // strong refs (not self), so they live as long as the cleanup
+        // needs them. The producer waitForFinish has to come before
+        // closing the demuxer / cache / server because the pump
+        // accesses them by reference during the unwind; the closure
+        // serialises that ordering off-thread.
+        Task.detached {
+            _ = p?.waitForFinish(timeout: 3.0)
+            s?.stop()
+            c?.close()
+            ab?.close()
+            d?.close()
+        }
     }
 
     deinit {

@@ -479,7 +479,18 @@ public final class AetherEngine: ObservableObject {
         var probedDefaultAudioIndex: Int32 = -1
         let probe = Demuxer()
         do {
-            try probe.open(url: url, extraHeaders: options.httpHeaders)
+            // Detach the HTTP probe + avformat_open_input + avformat_find_stream_info
+            // off the @MainActor so the SwiftUI host stays responsive.
+            // On a slow CDN this is the dominant blocking call in
+            // `load()` (~6 s). Per Delarkz's AetherEngine#10: a @MainActor
+            // async function whose body is synchronous Swift blocks the
+            // main thread despite the `async` signature — there's no
+            // suspension point. `Task.detached.value` introduces a real
+            // hop to a background thread so the @MainActor runloop keeps
+            // ticking.
+            try await Task.detached(priority: .userInitiated) { [probe] in
+                try probe.open(url: url, extraHeaders: options.httpHeaders)
+            }.value
             let videoIdx = probe.videoStreamIndex
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {
                 detectedFormat = Self.detectVideoFormat(stream: stream)
@@ -677,8 +688,14 @@ public final class AetherEngine: ObservableObject {
                 self.sourceTime = self.currentTime + seconds
             }
         }
-        // AVPlayer HLS playback over the loopback HTTP server.
-        let playbackURL = try session.start()
+        // AVPlayer HLS playback over the loopback HTTP server. Detach
+        // the synchronous network I/O inside `session.start()` (opens
+        // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)
+        // so the @MainActor doesn't block. See the probe-detach comment
+        // above for the rationale.
+        let playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
+            try session.start()
+        }.value
         self.nativeVideoSession = session
 
         let host = NativeAVPlayerHost()
@@ -800,12 +817,18 @@ public final class AetherEngine: ObservableObject {
             }
             .store(in: &softwareCancellables)
 
-        try await host.load(
-            url: url,
-            sourceHTTPHeaders: sourceHTTPHeaders,
-            startPosition: startPosition,
-            audioSourceStreamIndex: audioSourceStreamIndex
-        )
+        // Detach the host's load (its body is synchronous despite the
+        // `async` signature — a @MainActor caller awaiting it doesn't
+        // yield to the runloop). Mirrors the same pattern applied to
+        // the probe and to `session.start()`.
+        try await Task.detached(priority: .userInitiated) { [host] in
+            try await host.load(
+                url: url,
+                sourceHTTPHeaders: sourceHTTPHeaders,
+                startPosition: startPosition,
+                audioSourceStreamIndex: audioSourceStreamIndex
+            )
+        }.value
     }
 
     // MARK: - Transport

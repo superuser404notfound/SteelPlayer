@@ -200,10 +200,53 @@ final class AudioBridge: @unchecked Sendable {
         let sampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
             ? srcCodecpar.pointee.sample_rate
             : 48000
-        let nChannels: Int32 = (srcCodecpar.pointee.ch_layout.nb_channels > 0
-                                && srcCodecpar.pointee.ch_layout.nb_channels <= 8)
-            ? srcCodecpar.pointee.ch_layout.nb_channels
-            : 2
+
+        // Channel-count resolution. Try sources in order:
+        //   1. srcCodecpar.ch_layout — populated by the demuxer from the
+        //      container's audio track header (matroska Channels element,
+        //      mp4 audio sample entry, etc.). Most sources land here.
+        //   2. dec.ch_layout after avcodec_open2 — some codecs propagate
+        //      a default layout from the decoder's init function even
+        //      without a frame decode.
+        //   3. Fallback to stereo, with a loud log line so the silent
+        //      surround → stereo downmix doesn't go unnoticed.
+        //
+        // Matroska doesn't reliably populate Channels for TrueHD / MLP:
+        // the codec's bitstream carries the layout, but the container
+        // header is optional. When both srcCodecpar and dec come back at
+        // 0, the bridge defaults to stereo and the resampler downmixes
+        // the actual 7.1 / 5.1 source — which is the symptom we ship a
+        // warning for so future-us has a logged repro to fix on (the
+        // proper fix is peeking the first packet to settle ch_layout
+        // before opening the encoder).
+        let containerChannels = srcCodecpar.pointee.ch_layout.nb_channels
+        let decoderChannels = dec.pointee.ch_layout.nb_channels
+        let resolvedChannels: Int32
+        let resolvedSource: String
+        if containerChannels > 0 && containerChannels <= 8 {
+            resolvedChannels = containerChannels
+            resolvedSource = "container"
+        } else if decoderChannels > 0 && decoderChannels <= 8 {
+            resolvedChannels = decoderChannels
+            resolvedSource = "decoder"
+        } else {
+            resolvedChannels = 2
+            resolvedSource = "fallback (stereo)"
+            EngineLog.emit(
+                "[AudioBridge] WARNING: source channel layout unresolved at bridge init "
+                + "(container=\(containerChannels), decoder=\(decoderChannels)); "
+                + "defaulting to stereo. Surround / Atmos sources will be downmixed. "
+                + "Codec: \(srcCodecID.rawValue). Need to peek first packet to fix.",
+                category: .session
+            )
+        }
+        EngineLog.emit(
+            "[AudioBridge] init: codec=\(srcCodecID.rawValue) "
+            + "sampleRate=\(sampleRate) channels=\(resolvedChannels) "
+            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
+            category: .session
+        )
+        let nChannels: Int32 = resolvedChannels
 
         enc.pointee.sample_rate = sampleRate
         enc.pointee.sample_fmt = pcmSampleFmt

@@ -1384,7 +1384,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AetherEngine#4, and is short enough that the libavformat
     /// matroska state + AVIOReader/URLSession churn don't accumulate
     /// to a jetsam-relevant resident set on long-form 4K HDR HEVC.
-    private static let demuxerRecycleIntervalSeconds: UInt64 = 120
+    ///
+    /// DIAGNOSTIC: temporarily disabled (24 h interval, effectively
+    /// never fires for any realistic playback). The 64 MB chunk +
+    /// close-cleanup + prefetch-race fixes did not reduce the long-form
+    /// leak. The next hypothesis to falsify: does the leak come from
+    /// the recycle teardown itself (libavformat / AVIOReader state not
+    /// fully released across the swap), or does it persist during
+    /// steady-state pumping with no recycles at all? If the leak goes
+    /// away here, recycle is the source and we need to fix or remove
+    /// it. If the leak remains, the source is in the steady-state pump
+    /// (URLSession completion-handler retention etc.).
+    private static let demuxerRecycleIntervalSeconds: UInt64 = 86400
 
     /// Time budget for the pump to reach a fragment-cut boundary
     /// after the recycle request lands. Generous; in practice the

@@ -631,6 +631,29 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let dvRecord = doviConfigRecord(from: codecpar)
             dvVariant = classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_HEVC)
 
+            // Dump the raw DV side data fields so a remote tester can
+            // photograph the diagnostic overlay and confirm what the
+            // demuxer surfaced for this source. Three fields drive
+            // every downstream routing decision: dv_profile (5/7/8),
+            // dv_bl_signal_compatibility_id (0/1/4 for no-base / HDR10
+            // / HLG), and dv_level (1-13, content frame-rate × HDR
+            // overhead). Pair with the source codecpar color fields
+            // so the AVPlayer-side color interpretation can be cross-
+            // checked against what FFmpeg parsed from the HEVC VUI.
+            if let r = dvRecord {
+                let cp = Int(codecpar.pointee.color_primaries.rawValue)
+                let trc = Int(codecpar.pointee.color_trc.rawValue)
+                let csp = Int(codecpar.pointee.color_space.rawValue)
+                EngineLog.emit(
+                    "[HLSVideoEngine] DV source: profile=\(r.dv_profile) "
+                    + "compat=\(r.dv_bl_signal_compatibility_id) "
+                    + "level=\(r.dv_level) rpu=\(r.rpu_present_flag) "
+                    + "el=\(r.el_present_flag) bl=\(r.bl_present_flag) "
+                    + "color_primaries=\(cp) color_trc=\(trc) color_space=\(csp)",
+                    category: .session
+                )
+            }
+
             let dvLevelRaw = Int(dvRecord?.dv_level ?? 0)
             let dvLevel = dvLevelRaw > 0 ? dvLevelRaw : 6
             let hevcLevelRaw = Int(codecpar.pointee.level)

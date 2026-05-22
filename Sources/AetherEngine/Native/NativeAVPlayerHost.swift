@@ -530,22 +530,60 @@ final class NativeAVPlayerHost {
         }
         for itemTrack in tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
-            guard assetTrack.mediaType == .audio else { continue }
             let fourcc: String
             var extra = ""
             if let fmt = assetTrack.formatDescriptions.first {
                 let cm = fmt as! CMFormatDescription
                 fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
-                extra = " " + audioFormatDescription(cm)
+                if assetTrack.mediaType == .audio {
+                    extra = " " + audioFormatDescription(cm)
+                } else if assetTrack.mediaType == .video {
+                    extra = " " + videoFormatDescription(cm)
+                }
             } else {
                 fourcc = "?"
             }
+            let trackLabel: String
+            if assetTrack.mediaType == .audio {
+                trackLabel = "audioTrack"
+            } else if assetTrack.mediaType == .video {
+                trackLabel = "videoTrack"
+            } else {
+                continue
+            }
             EngineLog.emit(
-                "[NativeAVPlayerHost] #\(sid) item.audioTrack codec='\(fourcc)' "
+                "[NativeAVPlayerHost] #\(sid) item.\(trackLabel) codec='\(fourcc)' "
                 + "enabled=\(itemTrack.isEnabled)\(extra) (readyToPlay)",
                 category: .engine
             )
         }
+    }
+
+    /// Compact one-line summary of a CMFormatDescription for video
+    /// tracks. Reads the picture dimensions plus the color attachments
+    /// AVPlayer applied (primaries / transfer / matrix / range), which
+    /// is what we need to compare against the source-side codecpar
+    /// values that we log from the engine in `[HLSVideoEngine] DV
+    /// source` / `prepared`. A mismatch here is a strong signal the
+    /// DV / HDR signaling didn't survive the muxer round-trip.
+    private static func videoFormatDescription(_ fmt: CMFormatDescription) -> String {
+        var parts: [String] = []
+        let dims = CMVideoFormatDescriptionGetDimensions(fmt)
+        parts.append("dim=\(dims.width)x\(dims.height)")
+        let extensions = CMFormatDescriptionGetExtensions(fmt) as? [String: Any] ?? [:]
+        if let primaries = extensions[kCMFormatDescriptionExtension_ColorPrimaries as String] as? String {
+            parts.append("primaries=\(primaries)")
+        }
+        if let transfer = extensions[kCMFormatDescriptionExtension_TransferFunction as String] as? String {
+            parts.append("transfer=\(transfer)")
+        }
+        if let matrix = extensions[kCMFormatDescriptionExtension_YCbCrMatrix as String] as? String {
+            parts.append("matrix=\(matrix)")
+        }
+        if let fullRange = extensions[kCMFormatDescriptionExtension_FullRangeVideo as String] as? Bool {
+            parts.append("fullRange=\(fullRange)")
+        }
+        return parts.joined(separator: " ")
     }
 
     /// One-line warning when the FLAC bridge has produced an N-channel

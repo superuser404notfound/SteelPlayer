@@ -515,7 +515,83 @@ final class AVIOReader: @unchecked Sendable {
 
     // MARK: - Network (seekable mode)
 
+    /// Long-lived URLSession dedicated to file-size probes. AetherEngine.load()
+    /// probes the same URL twice (once via probe Demuxer, once via session
+    /// Demuxer), and per-request sessions force a fresh TLS handshake each
+    /// time — Cloudflare-fronted origins can flag the changing TLS
+    /// fingerprint as suspicious, intermittently slowing or 400-ing the
+    /// repeat probe. A single long-lived session keeps the connection
+    /// pool warm and the fingerprint stable. Distinct from `syncRequest`'s
+    /// per-request session pattern, which is load-bearing for chunk-fetch
+    /// leak control but adds no benefit to a one-byte probe.
+    private static let probeSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 20
+        return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
+    }()
+
     private func probeFileSize() -> Int64 {
+        // Per Delarkz's AetherEngine#8: HEAD probes break against origins
+        // that reject HEAD (e.g. Cloudflare-fronted tb-cdn.st returning
+        // 405). Without a known file size AVIOReader falls back to
+        // streaming mode where SEEK_SET / SEEK_END both return -1, which
+        // breaks any demuxer that seeks on open (MKV / WebM Cues, AVI
+        // index, non-faststart MP4) and disables user scrubbing on
+        // everything else.
+        //
+        // Replace with Range bytes=0-0 GET, cancel in didReceive
+        // response so the body never streams. Fall back to HEAD if
+        // the Range probe doesn't yield a size (live-transcode URLs
+        // that don't accept Range early in the session).
+        if let size = rangeProbeFileSize(), size > 0 {
+            #if DEBUG
+            print("[AVIOReader] File size: \(size) bytes (Range probe)")
+            #endif
+            return size
+        }
+        return headProbeFileSize()
+    }
+
+    /// Range `bytes=0-0` GET that cancels in `didReceive response`.
+    /// Returns the total size parsed from `Content-Range: bytes 0-0/<TOTAL>`
+    /// on a 206 response, or `expectedContentLength` on a 2xx response
+    /// (some origins ignore Range and respond with full content + length).
+    /// Nil on cancellation, timeout, network error, or unparseable
+    /// Content-Range.
+    private func rangeProbeFileSize() -> Int64? {
+        var request = URLRequest(url: url)
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 20
+        applyExtraHeaders(&request)
+
+        let delegate = ProbeDelegate(extraHeaders: extraHeaders)
+        let task = Self.probeSession.dataTask(with: request)
+        task.delegate = delegate
+
+        let semaphore = DispatchSemaphore(value: 0)
+        delegate.onCompletion = { semaphore.signal() }
+        task.resume()
+
+        if semaphore.wait(timeout: .now() + .seconds(25)) == .timedOut {
+            task.cancel()
+            #if DEBUG
+            print("[AVIOReader] Range probe timed out → trying HEAD")
+            #endif
+            return nil
+        }
+
+        if delegate.totalSize == nil {
+            #if DEBUG
+            print("[AVIOReader] Range probe didn't yield a size → trying HEAD")
+            #endif
+        }
+        return delegate.totalSize
+    }
+
+    /// Legacy HEAD probe, kept as fallback for live-transcode endpoints
+    /// that don't accept Range early in the session.
+    private func headProbeFileSize() -> Int64 {
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = 5
@@ -532,7 +608,7 @@ final class AVIOReader: @unchecked Sendable {
             }
             let length = http.expectedContentLength
             #if DEBUG
-            print("[AVIOReader] File size: \(length) bytes\(length <= 0 ? " (streaming mode)" : "")")
+            print("[AVIOReader] File size: \(length) bytes (HEAD fallback)\(length <= 0 ? " streaming mode" : "")")
             #endif
             return length
         } catch {
@@ -678,6 +754,84 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
         }
         #endif
         onComplete()
+    }
+}
+
+// MARK: - Probe Delegate
+
+/// Per-task delegate for the file-size Range probe. Preserves the Range
+/// header across cross-host redirects (URLSession default drops it),
+/// captures the total size from the 206 response's `Content-Range`
+/// header, and cancels the task before the body streams.
+///
+/// `@unchecked Sendable` because the delegate is single-use per probe
+/// and is owned by the calling thread via the semaphore; URLSession's
+/// delegate callbacks run on its own queue but the calling thread
+/// blocks until `onCompletion` fires, so there's no concurrent access
+/// to the mutable fields.
+private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    let extraHeaders: [String: String]
+    var totalSize: Int64?
+    var onCompletion: (() -> Void)?
+
+    init(extraHeaders: [String: String]) {
+        self.extraHeaders = extraHeaders
+    }
+
+    /// Preserve the `Range` header (and the caller-supplied extra
+    /// headers) on cross-host redirects. URLSession's default
+    /// `willPerformHTTPRedirection` strips custom request headers when
+    /// the redirect changes host; without this, the redirected origin
+    /// (e.g. Cloudflare CDN behind an AIOStreams proxy) sees a regular
+    /// GET and either streams the full body or `400 Bad Request`s on
+    /// proxies that require Range.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        var updated = request
+        if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
+            updated.setValue(originalRange, forHTTPHeaderField: "Range")
+        }
+        for (name, value) in extraHeaders {
+            updated.setValue(value, forHTTPHeaderField: name)
+        }
+        completionHandler(updated)
+    }
+
+    /// Capture Content-Range total size, then cancel so the body
+    /// never streams. The fast path is a 206 response with
+    /// `Content-Range: bytes 0-0/<TOTAL>`; we also accept a plain
+    /// 2xx with a positive `Content-Length`, which is what some
+    /// origins return when they ignore Range entirely on the first
+    /// byte.
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        defer { completionHandler(.cancel) }
+        guard let http = response as? HTTPURLResponse else { return }
+        if http.statusCode == 206,
+           let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+           let slash = contentRange.firstIndex(of: "/") {
+            let totalString = contentRange[contentRange.index(after: slash)...]
+            if totalString != "*", let size = Int64(totalString) {
+                totalSize = size
+                return
+            }
+        }
+        if (200...299).contains(http.statusCode), http.expectedContentLength > 0 {
+            totalSize = http.expectedContentLength
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        onCompletion?()
     }
 }
 

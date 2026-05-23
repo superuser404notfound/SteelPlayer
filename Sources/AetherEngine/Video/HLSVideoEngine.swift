@@ -61,7 +61,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         case profile5          // HEVC P5  (IPT-PQ-c2, no base)     → dvh1 + PQ
         case profile81         // HEVC P8.1 with HDR10-compat base  → dvh1 + PQ  (on DV display)
         case profile84         // HEVC P8.4 with HLG-compat base    → hvc1 + HLG + SUPPLEMENTAL dvh1/db4h
-        case profile7          // HEVC P7 dual-layer                → reject
+        case profile7          // HEVC P7 dual-layer (BL = HDR10)   → hvc1 + PQ (BL only)
         case profile82         // HEVC P8.2 with SDR-compat base    → reject
         case av1Profile10      // AV1 P10.0 (no base)               → dav1 + PQ
         case av1Profile101     // AV1 P10.1 with HDR10-compat base  → dav1 + PQ
@@ -721,7 +721,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
                 supplementalCodecs = "dvh1.08.\(dvLevelStr)/db4h"
             case .profile7:
-                throw HLSVideoEngineError.unsupportedDVProfile(profile: 7, compatID: -1)
+                // P7 dual-layer (UHD-BD remux territory). The bitstream
+                // carries an HEVC Main10 base layer + an enhancement
+                // layer + RPU; Apple has no system-level P7 decoder, so
+                // the only legal path on tvOS is to play the base layer
+                // as plain HEVC HDR10. AVPlayer's Main10 decoder ignores
+                // NAL units with `nuh_layer_id != 0` per the HEVC spec
+                // (Annex F multi-layer extension), which leaves just
+                // the BL frames going through the video pipeline. The
+                // EL NALs ride along in the fMP4 samples (modest
+                // bandwidth cost on a local segment cache), the panel
+                // sees HDR10 PQ, no DV mode is requested.
+                //
+                // `dv_bl_signal_compatibility_id` is typically 6 for P7
+                // sources. The spec uses 6 as a P7-specific marker
+                // rather than a formal HDR10 backwards-compat flag, but
+                // the BL is always PQ HEVC Main10 by construction since
+                // UHD-BD requires HDR10 backwards-compat. We don't read
+                // compat here because all P7 routes the same way.
+                codecTagOverride = "hvc1"
+                videoRange = .pq
+                primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
+                supplementalCodecs = nil
             case .profile82:
                 throw HLSVideoEngineError.unsupportedDVProfile(profile: 8, compatID: 2)
             case .unknown:

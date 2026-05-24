@@ -31,6 +31,14 @@ public enum EngineLog {
         /// category — session start/stop, lifecycle errors, anything
         /// that crosses subsystem boundaries.
         case engine
+        /// FFmpeg-internal diagnostics forwarded by `FFmpegLogBridge`
+        /// from `av_log_set_callback`. Covers the muxer, demuxer,
+        /// encoders, and decoders as a single stream — FFmpeg's own
+        /// `[mp4 @ ...]` / `[h264 @ ...]` prefixes preserved by
+        /// `av_log_format_line2` identify the originating subsystem.
+        /// Threshold defaults to `AV_LOG_WARNING`; hosts that want
+        /// verbose output call `FFmpegLogBridge.install(level:)`.
+        case ffmpeg
         /// `HLSVideoEngine` session orchestration: segment plan,
         /// segment-cache lifecycle, muxer resets, anything in
         /// `VideoSegmentProvider.mediaSegment(at:)`.

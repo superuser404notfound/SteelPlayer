@@ -359,6 +359,11 @@ public final class AetherEngine: ObservableObject {
     private var lifecycleObservers: [Any] = []
 
     public init() throws {
+        // Route FFmpeg's av_log output into EngineLog before any
+        // libav* entry point runs, so probe/load diagnostics land in
+        // Console.app + the host handler from the very first call.
+        FFmpegLogBridge.install()
+
         // Configure audio session for multichannel playback. AVPlayer
         // needs `.playback` + `.moviePlayback` + multichannel-content
         // enabled before its first asset opens, otherwise output is

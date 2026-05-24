@@ -140,7 +140,12 @@ final class LiveTelemetrySampler {
                 networkThroughputMbps = nil
                 networkTransferredBytes = nil
             }
-            avSyncGapMs = nil
+            // Gap is measured by HLSSegmentProducer (audio gate open vs.
+            // video gate open in source-clock ms). The producer only runs
+            // on the native path, so this is where the value belongs;
+            // the software host enqueues directly into the sample buffer
+            // and has no comparable pre-mux gap to expose.
+            avSyncGapMs = engine.lastAVGapMs
             forwardBufferSeconds = Self.computeNativeForwardBuffer(engine: engine)
 
         case .software:
@@ -160,7 +165,7 @@ final class LiveTelemetrySampler {
             // demuxer pulls the same bytes off the network).
             networkThroughputMbps = instantBitrateMbps
             networkTransferredBytes = demuxerBytes
-            avSyncGapMs = engine.lastAVGapMs
+            avSyncGapMs = nil  // see .native arm — the producer that measures the gap doesn't run on this path
             forwardBufferSeconds = nil  // software host has no comparable surface yet
 
         case .aether, .none:

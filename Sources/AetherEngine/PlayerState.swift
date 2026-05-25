@@ -150,6 +150,28 @@ public struct LoadOptions: Sendable, Equatable {
     /// soundbar / basic-AVR install base.
     public var audioBridgeMode: AudioBridgeMode
 
+    /// Treat the source as a live stream (e.g. IPTV HTTP MPEG-TS, raw
+    /// `live.ts` over HTTP, broadcaster feeds). When `true`:
+    ///
+    /// - `seek(to:)` becomes a no-op with a warning log. Live sources
+    ///   have no random-access guarantee and seek would either stall
+    ///   AVPlayer indefinitely or land outside the producer's segment
+    ///   window.
+    /// - The engine's `isLive` published surface reflects this for
+    ///   host UIs (hide the scrubber, hide duration, etc.).
+    ///
+    /// Scope today: H.264 / HEVC inside MPEG-TS over HTTP routes
+    /// through the native AVPlayer path via the existing HLS-fMP4
+    /// remuxer. MPEG-2 / MPEG-4 Part 2 / VC-1 inside MPEG-TS routes
+    /// through the SW pipeline. The sliding-window segment eviction
+    /// for unbounded-duration sources is not yet implemented; long
+    /// sessions on the native path will accumulate cached segments.
+    /// Set this flag explicitly when the host knows the URL is a live
+    /// feed; auto-detection from `probe.durationSeconds == 0` is too
+    /// noisy (VOD MKVs with broken duration headers report the same).
+    /// Default `false`.
+    public var isLive: Bool
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -157,7 +179,8 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
-        audioBridgeMode: AudioBridgeMode = .surroundCompat
+        audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        isLive: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -166,6 +189,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioBridgeMode = audioBridgeMode
+        self.isLive = isLive
     }
 }
 
@@ -222,6 +246,13 @@ public struct SourceProbe: Sendable {
     /// Subtitle tracks in source order, both embedded text and
     /// bitmap (PGS / DVB) variants.
     public let subtitleTracks: [TrackInfo]
+    /// Best-effort live-stream hint: `true` when the source advertises
+    /// no duration AND the URL scheme suggests a network feed
+    /// (http / https / udp / rtp / rtsp). False positives are possible
+    /// (VOD MKVs with broken duration headers), so this is a hint for
+    /// hosts to decide whether to set `LoadOptions.isLive`, not a
+    /// definitive classification.
+    public let isLive: Bool
 
     public init(
         url: URL,
@@ -234,7 +265,8 @@ public struct SourceProbe: Sendable {
         videoFrameRate: Double?,
         isDolbyVision: Bool,
         audioTracks: [TrackInfo],
-        subtitleTracks: [TrackInfo]
+        subtitleTracks: [TrackInfo],
+        isLive: Bool = false
     ) {
         self.url = url
         self.durationSeconds = durationSeconds
@@ -247,6 +279,7 @@ public struct SourceProbe: Sendable {
         self.isDolbyVision = isDolbyVision
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
+        self.isLive = isLive
     }
 }
 

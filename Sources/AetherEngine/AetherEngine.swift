@@ -72,8 +72,9 @@ public final class AetherEngine: ObservableObject {
     /// to `.native` for AVPlayer-decodable sources (HEVC, H.264, plus
     /// AV1 on HW-AV1 devices) or `.software` when the source falls
     /// through to `SoftwarePlaybackHost` (SW dav1d for AV1 without HW,
-    /// libavcodec for VP9). Kept on the public surface for diagnostic
-    /// overlays and TestFlight badges; hosts should not switch on it.
+    /// libavcodec for VP9, MPEG-4 Part 2, MPEG-2, VC-1). Kept on the
+    /// public surface for diagnostic overlays and TestFlight badges;
+    /// hosts should not switch on it.
     @Published public private(set) var playbackBackend: PlaybackBackend = .none
 
     /// 1 Hz snapshot of live playback telemetry while the engine is
@@ -89,6 +90,8 @@ public final class AetherEngine: ObservableObject {
     ///   capable devices).
     /// - `"dav1d AV1 (SW)"` for AV1 falling through to the SW pipeline.
     /// - `"libavcodec VP9 (SW)"` for VP9.
+    /// - `"libavcodec MPEG4 (SW)"` etc. for legacy codecs AVPlayer
+    ///   cannot decode (MPEG-4 Part 2, MPEG-2, VC-1).
     /// `nil` while no playback session is loaded. Cleared in
     /// `stopInternal` so a new session never inherits the previous
     /// label.
@@ -117,6 +120,14 @@ public final class AetherEngine: ObservableObject {
     @Published public private(set) var isLoadingSubtitles: Bool = false
     /// True when sidecar subtitles are the active subtitle source.
     @Published public private(set) var isSubtitleActive: Bool = false
+
+    /// True while the active session is a live stream (the host set
+    /// `LoadOptions.isLive = true` at load time). Hosts use this to
+    /// hide duration / scrubber UI, skip seek affordances, and switch
+    /// the transport-bar layout to a now-only badge. Cleared in
+    /// `stopInternal` so a finished live session doesn't bleed flag
+    /// state into the next VOD load.
+    @Published public private(set) var isLive: Bool = false
 
     // MARK: - Output
 
@@ -433,10 +444,18 @@ public final class AetherEngine: ObservableObject {
             return String(cString: cstr)
         }()
         let snappedRate = detectedRate.flatMap { FrameRateSnap.snap($0) }
+        let duration = demuxer.duration
+        // Live-stream hint: duration absent + network-feed URL scheme.
+        // Heuristic only; hosts decide whether to flip
+        // LoadOptions.isLive based on this plus their own context
+        // (e.g. an IPTV catalog entry vs a movie file).
+        let liveSchemes: Set<String> = ["http", "https", "udp", "rtp", "rtsp"]
+        let isLive = duration <= 0
+            && liveSchemes.contains(url.scheme?.lowercased() ?? "")
 
         return SourceProbe(
             url: url,
-            durationSeconds: demuxer.duration,
+            durationSeconds: duration,
             videoFormat: detectedFormat,
             videoCodecID: Int32(bitPattern: detectedCodecID.rawValue),
             videoCodecName: codecName,
@@ -445,7 +464,8 @@ public final class AetherEngine: ObservableObject {
             videoFrameRate: snappedRate,
             isDolbyVision: detectedFormat == .dolbyVision,
             audioTracks: demuxer.audioTrackInfos(),
-            subtitleTracks: demuxer.subtitleTrackInfos()
+            subtitleTracks: demuxer.subtitleTrackInfos(),
+            isLive: isLive
         )
     }
 
@@ -490,6 +510,7 @@ public final class AetherEngine: ObservableObject {
         stopInternal()
         loadedURL = url
         loadedOptions = options
+        isLive = options.isLive
         state = .loading
         currentTime = 0
         duration = 0
@@ -623,6 +644,12 @@ public final class AetherEngine: ObservableObject {
         //      aetherctl on macOS 26 against a libvpx-vp9 source
         //      (AVPlayer GETs master.m3u8 + media.m3u8 then silently
         //      stops fetching, `item.status` never leaves `.unknown`).
+        //    - MPEG-4 Part 2 (XVID / DIVX / SP / ASP), MPEG-2 video,
+        //      VC-1: always SW. AVPlayer's HLS-fMP4 pipeline does not
+        //      accept these codecs (`mp4v.20.X`, `mp2v`, `vc-1` are
+        //      not in Apple's HLS Authoring Spec CODECS list).
+        //      libavcodec ships native decoders for all three in
+        //      FFmpegBuild; SoftwareVideoDecoder is codec-generic.
         //
         //    Everything else (HEVC / H.264) goes through the native
         //    path unconditionally.
@@ -630,7 +657,10 @@ public final class AetherEngine: ObservableObject {
         switch detectedCodecID {
         case AV_CODEC_ID_AV1:
             useSoftwarePath = !VTCapabilityProbe.av1Available
-        case AV_CODEC_ID_VP9:
+        case AV_CODEC_ID_VP9,
+             AV_CODEC_ID_MPEG4,
+             AV_CODEC_ID_MPEG2VIDEO,
+             AV_CODEC_ID_VC1:
             useSoftwarePath = true
         default:
             useSoftwarePath = false
@@ -950,6 +980,14 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func seek(to seconds: Double) async {
+        // Live streams have no random-access guarantee; AVPlayer would
+        // either stall indefinitely or land on a segment that the
+        // playlist hasn't materialised. Hosts can hide the scrubber by
+        // observing `$isLive` so this guard is a defence-in-depth.
+        guard !isLive else {
+            EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: source is live", category: .engine)
+            return
+        }
         let target = max(0, min(seconds, duration))
         state = .seeking
         if let host = softwareHost {
@@ -1617,6 +1655,7 @@ public final class AetherEngine: ObservableObject {
         // `selectAudioTrack` before the next `load(url:)` repopulates
         // `audioTracks`.
         activeAudioTrackIndex = nil
+        isLive = false
     }
 
     // MARK: - Memory diagnostic
@@ -1889,13 +1928,13 @@ public final class AetherEngine: ObservableObject {
             return String(cString: cstr).uppercased()
         }()
         if isSoftware {
-            // Only two real paths through the SW host today: AV1 via
-            // dav1d, VP9 via libavcodec's vp9 decoder. Anything else
-            // routes through the native pipeline, so this branch can be
-            // exhaustive without a generic fallback.
+            // SW host paths: AV1 via dav1d, VP9 via libavcodec's vp9
+            // decoder, plus legacy codecs AVPlayer's HLS-fMP4 pipeline
+            // does not accept (MPEG-4 Part 2 / MPEG-2 / VC-1) via the
+            // matching libavcodec native decoder. SoftwareVideoDecoder
+            // resolves the actual decoder via `avcodec_find_decoder`.
             switch codecID {
             case AV_CODEC_ID_AV1: return "dav1d \(name) (SW)"
-            case AV_CODEC_ID_VP9: return "libavcodec \(name) (SW)"
             default:              return "libavcodec \(name) (SW)"
             }
         }

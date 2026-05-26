@@ -697,86 +697,63 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 primaryCodecs = "dvh1.05.\(dvLevelStr)"
                 supplementalCodecs = nil
             case .profile81:
-                // P8.1 (HDR10-compat base layer). Two branches based on
-                // display capability:
-                //
-                // DV-capable panel (`effectiveDvMode == true`): emit
-                // Apple's HLS Authoring Spec post-WWDC22 signaling for
-                // backward-compatible DV: `hvc1` sample entry + `hvcC`
-                // + `dvvC` boxes (the mp4 muxer with `strict=-2` writes
-                // dvvC automatically when DV side data is preserved on
+                // P8.1 (HDR10-compat base layer). Per Apple's HLS
+                // Authoring Spec appendix on SUPPLEMENTAL-CODECS
+                // (post-WWDC22), backward-compatible DV ships with
+                // `hvc1` sample entry + `hvcC` + `dvvC` boxes
+                // (the mp4 muxer with `strict=-2` writes dvvC
+                // automatically when DV side data is preserved on
                 // the codecpar), primary CODECS `hvc1.2.4.LXX`,
                 // SUPPLEMENTAL-CODECS `dvh1.08.XX/db1p`. The `/db1p`
                 // brand identifier marks the supplemental as DV with
-                // HDR10 base for AVPlayer's profile-matching; without
-                // it the variant is treated as plain HDR10 and the DV
-                // pipeline never engages. AVKit's auto-criteria parser
-                // reads the dvvC from the live AVPlayerItem.
-                // formatDescription via the private CoreMedia hook.
+                // HDR10 base for AVPlayer's profile-matching.
                 //
-                // Non-DV panel (HDR10-only): emit plain HEVC HDR10 and
-                // STRIP DV side data so the muxer writes a clean
-                // `hvc1` + `hvcC` sample entry with NO dvvC box. The
-                // SUPPLEMENTAL hint causes AVPlayer to engage the DV
-                // codec path even on HDR10-only displays and fail
-                // silently (regression in 1.4.2, fixed in f7e9f77 by
-                // gating SUPPLEMENTAL on `effectiveDvMode`). But a
-                // dvvC box left in the sample entry trips tvOS 26's
-                // master-level codec filter with -11868 even when
-                // CODECS is plain `hvc1.2.4.LXX` (Vincent test
-                // 2026-05-26: HDR10 TV + match dynamic range ON,
-                // panel switches to HDR correctly but `item.status`
-                // goes `.failed` with `AVFoundationErrorDomain -11868`
-                // / `CoreMediaErrorDomain -17223`, picture stays
-                // black). Stripping DV side data mirrors P7's strategy
-                // (P7 always strips because no Apple TV chip has a P7
-                // decoder); for P8.1 we strip conditionally based on
-                // display capability since DV-capable panels need the
-                // dvvC for the upgrade path.
+                // Emitted unconditionally regardless of panel DV
+                // capability (DrHurt #4 2026-05-26 architectural
+                // call): "we shouldn't need to strip DV for P8.1 on
+                // non-DV panels. Apple's SDR-to-HDR/DV tone-mapping
+                // is industry-leading." Engine-driven display criteria
+                // sets `codecTag = dvh1` for every DV source in
+                // `AetherEngine.load` (panel-independent); when the
+                // panel can't reach DV mode the criteria still
+                // applies, AVPlayer's HLS variant validator passes
+                // because the active panel mode supports the
+                // declared VIDEO-RANGE, and tone-mapping handles the
+                // DV → HDR10 downgrade on the decode side. The
+                // earlier conditional strip-on-non-DV was a workaround
+                // for symptoms whose actual root cause was Sodalite's
+                // AVKit-sole-writer host config — fixed by reverting
+                // to engine-driven criteria in Sodalite 1b6bbae1.
                 codecTagOverride = "hvc1"
                 videoRange = .pq
                 primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
-                if effectiveDvMode {
-                    supplementalCodecs = "dvh1.08.\(dvLevelStr)/db1p"
-                } else {
-                    supplementalCodecs = nil
-                    stripDolbyVisionMetadata = true
-                }
+                supplementalCodecs = "dvh1.08.\(dvLevelStr)/db1p"
             case .profile84:
-                // P8.4 (HLG-compat base layer). Two branches mirror P8.1:
+                // P8.4 (HLG-compat base layer). Mirrors P8.1's
+                // unconditional emission per DrHurt #4 2026-05-26:
+                // `hvc1` sample entry + `hvcC` + `dvvC` boxes, primary
+                // CODECS `hvc1.2.4.LXX`, SUPPLEMENTAL-CODECS
+                // `dvh1.08.XX/db4h`. The `/db4h` brand identifier
+                // marks the supplemental as DV with HLG base for
+                // AVPlayer's profile matching.
                 //
-                // DV-capable panel (`effectiveDvMode == true`): emit
-                // `hvc1` sample entry + `hvcC` + `dvvC` boxes (mp4
-                // muxer writes dvvC automatically when DV side data
-                // is preserved on the codecpar), primary CODECS
-                // `hvc1.2.4.LXX`, SUPPLEMENTAL-CODECS `dvh1.08.XX/db4h`.
-                // The `/db4h` brand identifier marks the supplemental
-                // as DV with HLG base for AVPlayer's profile matching;
-                // AVKit's auto-criteria reads dvvC from the live
-                // formatDescription and drives DV mode on the panel.
+                // No panel-conditional branch and no DV-side-data
+                // strip. Engine-driven display criteria with codecTag
+                // = dvh1 (set in AetherEngine.load for all DV
+                // sources) asks AVDisplayManager for DV mode; on
+                // panels that can't reach DV, AVPlayer's tone-mapper
+                // downgrades to HLG (or HDR10 if HLG isn't supported).
                 //
-                // Non-DV panel (HDR10 / HLG-capable / SDR): emit plain
-                // HEVC HLG and STRIP DV side data so init.mp4 has a
-                // clean `hvc1` + `hvcC` sample entry with NO dvvC.
-                // Mirrors P8.1's strip path (Vincent test 2026-05-26
-                // on HDR10 panel: dvvC in init.mp4 trips tvOS 26's
-                // master-level codec filter even when master CODECS
-                // is plain hvc1.2.4 with no SUPPLEMENTAL). The plain
-                // HLG variant plays on HLG-capable panels and gets
-                // tonemapped on HDR10 / SDR panels by AVPlayer's
-                // auto-tonemap path. Bare `dvh1` sample entry was
-                // never an option for HLG-base regardless of panel
-                // (DrHurt #4 Build 160: AVPlayer rejects dvh1 +
-                // HLG transfer outright).
+                // Bare `dvh1` sample entry was never an option for
+                // HLG-base regardless of panel (DrHurt #4 Build 160:
+                // AVPlayer rejects dvh1 + HLG transfer outright); the
+                // hvc1 + dvvC + SUPPLEMENTAL pattern is the only one
+                // that satisfies AVPlayer's HLS authoring spec on
+                // HLG-base DV.
                 codecTagOverride = "hvc1"
                 videoRange = .hlg
                 primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
-                if effectiveDvMode {
-                    supplementalCodecs = "dvh1.08.\(dvLevelStr)/db4h"
-                } else {
-                    supplementalCodecs = nil
-                    stripDolbyVisionMetadata = true
-                }
+                supplementalCodecs = "dvh1.08.\(dvLevelStr)/db4h"
             case .profile7:
                 // P7 dual-layer (UHD-BD remux territory). The bitstream
                 // carries an HEVC Main10 base layer + an enhancement

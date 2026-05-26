@@ -552,7 +552,18 @@ public final class AetherEngine: ObservableObject {
                 detectedFormat = Self.detectVideoFormat(stream: stream)
                 effectiveFormat = Self.effectiveVideoFormat(detected: detectedFormat, stream: stream)
                 detectedRate = Self.detectFrameRate(stream: stream)
-                detectedDVProfile = (effectiveFormat == .dolbyVision)
+                // DrHurt #4 (2026-05-26): use SOURCE-detected DV profile,
+                // not effective-format. Drives `codecTag = dvh1` in the
+                // display-criteria apply() call below, asking AVDisplayManager
+                // for DV mode on every DV source regardless of whether the
+                // panel reports DV capability. Apple's HLS pipeline + tone-
+                // mapper is industry-leading at downgrading DV → HDR10
+                // when the active panel mode can't host DV; we let AVPlayer
+                // do that work instead of pre-emptively stripping DV signals
+                // engine-side. Pairs with the always-emit-SUPPLEMENTAL +
+                // no-strip change in HLSVideoEngine's profile81 / profile84
+                // emission.
+                detectedDVProfile = (detectedFormat == .dolbyVision)
                 detectedCodecID = stream.pointee.codecpar.pointee.codec_id
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height

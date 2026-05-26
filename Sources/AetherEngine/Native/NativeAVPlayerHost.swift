@@ -139,25 +139,7 @@ final class NativeAVPlayerHost {
         // Engine sets this to `false` for SDR-fallback paths so the
         // 4K HDR per-frame metadata path is bypassed and the leak
         // suspect is removed from those sessions.
-        // DIAGNOSTIC EXPERIMENT 2026-05-26 (do not ship): hardcoded
-        // false to test whether `appliesPerFrameHDRDisplayMetadata`
-        // is the cause of universal item.failed -11868 on tvOS 26.5.
-        // Vincent test logs show `item.duration=indef`, `item.tracks
-        // count=0`, `item.presentationSize=(0,0)`, zero errorLog and
-        // accessLog events at .failed — i.e. AVPlayer rejected the
-        // variant before engaging the HLS pipeline. Apple docs say
-        // the default is true, so explicit true should be a no-op,
-        // but tvOS 26.5 may have added strict validation that
-        // mismatches our master playlist (`VIDEO-RANGE=PQ` without
-        // SUPPLEMENTAL-CODECS/HDR10+ hint). If hardcoded false makes
-        // item.status reach .readyToPlay, the flag is confirmed
-        // culprit and we gate it on panel DV-capability + source
-        // metadata availability. If still .failed, eliminate.
-        //
-        // Caller's `perFrameHDR` argument intentionally ignored for
-        // this experiment.
-        _ = perFrameHDR
-        item.appliesPerFrameHDRDisplayMetadata = false
+        item.appliesPerFrameHDRDisplayMetadata = perFrameHDR
         // Apply any externalMetadata the host has pre-staged before this
         // load (e.g. system Now Playing title + artwork). Setting it
         // BEFORE AVPlayer.replaceCurrentItem-equivalent is the documented

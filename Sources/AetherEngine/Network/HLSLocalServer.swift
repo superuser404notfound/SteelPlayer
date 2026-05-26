@@ -722,7 +722,7 @@ final class HLSLocalServer: @unchecked Sendable {
             "Content-Type: \(contentType)\r\n" +
             "Content-Length: \(data.count)\r\n" +
             "Access-Control-Allow-Origin: *\r\n" +
-            "Cache-Control: no-store\r\n" +
+            "Cache-Control: no-cache\r\n" +
             "Connection: keep-alive\r\n" +
             "\r\n"
         let headerData = Data(header.utf8)
@@ -756,7 +756,7 @@ final class HLSLocalServer: @unchecked Sendable {
             "Content-Type: \(contentType)\r\n" +
             "Content-Length: \(fileSize)\r\n" +
             "Access-Control-Allow-Origin: *\r\n" +
-            "Cache-Control: no-store\r\n" +
+            "Cache-Control: no-cache\r\n" +
             "Connection: keep-alive\r\n" +
             "\r\n"
         let headerData = Data(header.utf8)

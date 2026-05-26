@@ -308,6 +308,47 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var hasReportedHDR10Plus = false
     private let hdr10PlusLock = NSLock()
 
+    /// Whether the current audio output route can carry an EAC3+JOC
+    /// Atmos bitstream end-to-end. Atmos requires either HDMI
+    /// passthrough to an Atmos-decoding AVR / soundbar (DD+ JOC
+    /// passthrough, or MAT 2.0 carrier for Apple's 2-channel-tunneled
+    /// variant) or Apple's spatial-audio renderer over a spatial-
+    /// capable route (AirPods H1 / H2 with HRTF). The Bluetooth A2DP
+    /// / LE codec stack (SBC / AAC / aptX, all stereo PCM) cannot
+    /// carry EAC3+JOC under any circumstances.
+    ///
+    /// On A2DP / LE routes AVPlayer's variant-selection refuses to
+    /// construct an AVPlayerItem for a JOC variant and fails item
+    /// open with `AVFoundationErrorDomain -11868` / `CoreMediaError
+    /// Domain -17223` before any segment is fetched (errorLog stays
+    /// empty, init.mp4 never requested). Vincent test 2026-05-26 on
+    /// Bose SLIII A2DP sink: stream 1 (EAC3 5.1) downmixed and played
+    /// fine, audio-track switch to stream 2 (EAC3+JOC Atmos) failed
+    /// with the -11868 signature and a "Wiedergabe gestoppt" overlay.
+    ///
+    /// Returns false only when Atmos is provably impossible
+    /// (`.bluetoothA2DP`, `.bluetoothLE`); the cascade then forces
+    /// the FLAC bridge so the bed channels still play (JOC objects
+    /// are discarded, but no renderer on this route could use them
+    /// anyway). Returns true for HDMI, AirPlay, and everything else
+    /// since the downstream path handles fallback there (HDMI
+    /// handshake decides passthrough vs LPCM; AirPlay receivers vary
+    /// and the engine has no portable way to probe them).
+    private static func currentRouteSupportsAtmosPassthrough() -> Bool {
+        #if os(iOS) || os(tvOS)
+        let route = AVAudioSession.sharedInstance().currentRoute
+        guard let primary = route.outputs.first else { return true }
+        switch primary.portType {
+        case .bluetoothA2DP, .bluetoothLE:
+            return false
+        default:
+            return true
+        }
+        #else
+        return true
+        #endif
+    }
+
     /// Approximate target segment duration in seconds. The hls muxer
     /// snaps cut points to keyframes at-or-after this threshold, so
     /// actual durations are this + GOP length variance. Apple's HLS
@@ -995,13 +1036,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // Disney+) all ship `ec-3` for both JOC and non-JOC
                 // EAC3 tracks; Atmos clients read `dec3` to upgrade.
                 let isJOC = compat == .eac3 && acp.profile == 30
-                audioHLSCodecs = compat.hlsCodecsString
-                EngineLog.emit(
-                    "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
-                    + "\(isJOC ? "[JOC=Atmos] " : "")"
-                    + "(fallback duration=\(audioFallbackDurationPts) in audioTb \(audioTb.num)/\(audioTb.den))",
-                    category: .session
-                )
+                // Route-driven Atmos downgrade. EAC3+JOC stream-copied
+                // into an fMP4 variant goes out as MAT 2.0 passthrough
+                // and AVPlayer's variant filter only accepts that on
+                // routes that can carry Atmos end-to-end. On Bluetooth
+                // A2DP / LE the filter rejects the item with -11868
+                // before init.mp4 is even fetched. Force the FLAC
+                // bridge here so the source EAC3 is decoded to bed-
+                // channel PCM and re-encoded by the bridge: object
+                // metadata is discarded (no renderer on this route
+                // could use it anyway), but the bed channels still
+                // play and AVPlayer downmixes to the route's available
+                // channel count. See `currentRouteSupportsAtmos
+                // Passthrough()` for the route signature.
+                if isJOC && !Self.currentRouteSupportsAtmosPassthrough() {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: JOC source on non-Atmos route (Bluetooth A2DP / LE) — "
+                        + "forcing FLAC bridge to avoid AVPlayer -11868 at variant selection. "
+                        + "Object metadata discarded; bed channels preserved.",
+                        category: .session
+                    )
+                    bridgePreferred = true
+                    streamCopyAudio = nil
+                    audioHLSCodecs = nil
+                } else {
+                    audioHLSCodecs = compat.hlsCodecsString
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
+                        + "\(isJOC ? "[JOC=Atmos] " : "")"
+                        + "(fallback duration=\(audioFallbackDurationPts) in audioTb \(audioTb.num)/\(audioTb.den))",
+                        category: .session
+                    )
+                }
             } else {
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec id=\(codecID.rawValue) unsupported, video-only",
@@ -1612,11 +1678,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     // Fall through to bridge attempt.
                 }
             }
-        } else if preferBridge && sourceIsAtmos {
+        } else if preferBridge && sourceIsAtmos && Self.currentRouteSupportsAtmosPassthrough() {
             // Caller pre-decided bridge before reaching here. For Atmos
-            // that's wrong — only legacy / non-fMP4-legal codecs should
-            // pre-bridge. Diagnose this explicitly so a future codec-
-            // table mistake doesn't silently degrade Atmos.
+            // that's wrong UNLESS the route can't carry Atmos at all
+            // (Bluetooth A2DP / LE), in which case the cascade setup
+            // intentionally forced the bridge and already logged a
+            // route-specific message. The remaining case — pre-bridge
+            // on an Atmos-capable route — would silently degrade
+            // Atmos, so diagnose it explicitly.
             EngineLog.emit(
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt — Atmos lost. Investigate the codec compatibility table.",
                 category: .session

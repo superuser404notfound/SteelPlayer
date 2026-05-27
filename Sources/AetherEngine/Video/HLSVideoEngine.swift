@@ -2224,8 +2224,43 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         // the sendfile path would skip the producer restart on
         // out-of-range fetches and AVPlayer would 404 indefinitely.
         extendVisibleWindow(toCover: index)
-        cache.declareTarget(index)
+        handleTargetChange(to: index)
         return cache.peekURL(index: index)
+    }
+
+    /// Update the cache's target index AND, if the change represents
+    /// a big backward jump, proactively relocate the producer.
+    /// Shared by both `mediaSegment(at:)` (Data path) and
+    /// `mediaSegmentURL(at:)` (sendfile path) — without unifying,
+    /// the sendfile path skips the proactive restart entirely, and
+    /// since the FIRST segment a back-scrub touches is almost always
+    /// a cache hit (seg-0..seg-N from the initial burst, served via
+    /// sendfile), the proactive restart would never fire when it
+    /// matters most. Symptom: user back-scrubs, AVPlayer fetches
+    /// cached seg-0..seg-10 via sendfile (target advances 0→10
+    /// without ever going through `mediaSegment(at:)`), then hits
+    /// seg-11 and falls into the reactive prune-gap restart with
+    /// AVPlayer's buffer at the thinnest — exactly the user-visible
+    /// post-scrub hang.
+    private func handleTargetChange(to index: Int) {
+        let previousTarget = cache.targetIndex
+        cache.declareTarget(index)
+
+        // Proactive relocation on backward-jump declareTarget.
+        // Threshold of 2 mirrors the empty-cache branch's tolerance
+        // for "near the producer's launch point, just wait" — small
+        // backward jumps (e.g. tvOS HLS's occasional speculative
+        // re-fetch of a recently-played segment) don't justify
+        // tearing down the producer.
+        if previousTarget >= 0, index < previousTarget - 2, let restart = restartHandler {
+            EngineLog.emit(
+                "[HLSVideoEngine] declareTarget backward jump \(previousTarget) → \(index), proactively restarting producer",
+                category: .session
+            )
+            lastRestartIndex = index
+            restart(index)
+            cache.resetHighWaterForRestart()
+        }
     }
 
     func mediaSegment(at index: Int) -> Data? {
@@ -2240,54 +2275,11 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         // "supposed to exist" yet.
         extendVisibleWindow(toCover: index)
 
-        // Declare AVPlayer's target FIRST so the cache window slides
-        // to centre on `index` before any subsequent producer store
-        // runs `pruneOutsideWindow`. Without this, a resume-style
-        // jump to seg-55 races with the producer's first store: the
-        // producer (after restart at 55) writes seg-55, the cache
-        // prunes with the still-default target=-1 / window=[-16,19],
-        // seg-55 is evicted before `fetch(55)` ever sees it, and
-        // AVPlayer times out on a segment that did exist for ~10 µs.
-        //
-        // Capture the previous target before this updates it so we
-        // can detect backward-jump declareTargets below.
-        let previousTarget = cache.targetIndex
-        cache.declareTarget(index)
-
-        // Proactive relocation on backward-jump declareTarget (typical
-        // case: user-initiated back-scrub). The producer is sequential
-        // forward-only; if we don't relocate it on a big backward jump
-        // it stays parked at its old write head (backpressured) while
-        // AVPlayer plays through the cached low end, and the first
-        // post-scrub fetch beyond the cache hits the reactive
-        // prune-gap restart path. That reactive restart costs ~150 ms
-        // of producer cold-start AT THE MOMENT AVPlayer is reaching
-        // the cache edge — when AVPlayer's forward buffer is already
-        // thinnest — and AVPlayer reacts by entering its conservative
-        // rebuffer-evaluation state, which the user perceives as the
-        // tail-end hang of the post-scrub hiccup.
-        //
-        // With proactive relocation, the new producer starts filling
-        // forward from `index` immediately while AVPlayer is still on
-        // seg-0 of the post-scrub cached low end. By the time AVPlayer's
-        // playback walks forward to the previously-pruned region, the
-        // producer has already written those segments and they hit the
-        // cache. AVPlayer never sees a server-side restart, just normal
-        // fetch latency.
-        //
-        // Threshold of 2 mirrors the empty-cache branch's tolerance for
-        // "near the producer's launch point, just wait" — small backward
-        // jumps (e.g. tvOS HLS's occasional speculative-prefetch re-fetch
-        // of a recent segment) don't justify a producer restart.
-        if previousTarget >= 0, index < previousTarget - 2, let restart = restartHandler {
-            EngineLog.emit(
-                "[HLSVideoEngine] declareTarget backward jump \(previousTarget) → \(index), proactively restarting producer",
-                category: .session
-            )
-            lastRestartIndex = index
-            restart(index)
-            cache.resetHighWaterForRestart()
-        }
+        // Update target + proactive-restart on big backward jump.
+        // See `handleTargetChange` for rationale; this path and the
+        // sendfile `mediaSegmentURL` path share the same logic so a
+        // back-scrub's first cache-hit doesn't slip past unnoticed.
+        handleTargetChange(to: index)
 
         // Fast path: serve from cache.
         if let hit = cache.peek(index: index) {

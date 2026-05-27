@@ -68,6 +68,23 @@ public final class AetherEngine: ObservableObject {
     @Published public private(set) var activeAudioTrackIndex: Int?
     @Published public private(set) var videoFormat: VideoFormat = .sdr
 
+    /// Source-detected video range as read from the demuxer probe, before
+    /// any panel clamping. Differs from `videoFormat` when the panel can't
+    /// present the source (e.g. DV source on an SDR panel, or HDR source
+    /// with Match Content off): there `videoFormat` reads `.sdr` because
+    /// that's what's on screen, while `sourceVideoFormat` keeps reading
+    /// `.dolbyVision` / `.hdr10` because that's what's in the file.
+    ///
+    /// Hosts that want to label media attributes (Stats for Nerds, file
+    /// inspectors) should use this. Hosts that drive UI tied to what the
+    /// panel is actually rendering (HDR badges, tone-mapping decisions)
+    /// should keep using `videoFormat`.
+    ///
+    /// Late HDR10+ upgrades from T.35 SEI flip this from `.hdr10` to
+    /// `.hdr10Plus` independent of `videoFormat`'s panel guard, because
+    /// SEI detection is a source-side fact.
+    @Published public private(set) var sourceVideoFormat: VideoFormat = .sdr
+
     /// Which internal backend rendered the current session. Resolves
     /// to `.native` for AVPlayer-decodable sources (HEVC, H.264, plus
     /// AV1 on HW-AV1 devices) or `.software` when the source falls
@@ -742,6 +759,10 @@ public final class AetherEngine: ObservableObject {
         videoFormat = (effectiveFormat != .sdr && panelWillPresentHDR)
             ? effectiveFormat
             : .sdr
+        // Source format is what the probe found in the file, before any
+        // panel clamping. Stats overlays use this to label "what the file
+        // is" vs `videoFormat` labelling "what the panel is showing".
+        sourceVideoFormat = detectedFormat
         audioTracks = probedAudioTracks
         subtitleTracks = probedSubtitleTracks
         // Mirror the audio stream HLSVideoEngine will actually pick.
@@ -2200,6 +2221,13 @@ public final class AetherEngine: ObservableObject {
     /// base layer in those cases.
     @MainActor
     private func handleHDR10PlusDetected() {
+        // Source upgrade runs independently of the panel guard below:
+        // a T.35 payload in the stream is a property of the file, so an
+        // HDR10 source that's currently clamped to .sdr for an SDR panel
+        // still has its sourceVideoFormat correctly bumped to .hdr10Plus.
+        if sourceVideoFormat == .hdr10 {
+            sourceVideoFormat = .hdr10Plus
+        }
         guard videoFormat == .hdr10 else { return }
         EngineLog.emit("[AetherEngine] HDR10+ T.35 detected, upgrading videoFormat .hdr10 → .hdr10Plus", category: .engine)
         videoFormat = .hdr10Plus

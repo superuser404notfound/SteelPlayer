@@ -612,17 +612,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Colour element directly into codecpar.color_* so the same
         // content as MKV plays cleanly; the mp4 demuxer has no
         // equivalent fallback. Forcing the canonical P5 color tuple
-        // here makes the muxer write a `colr nclx 9/16/9` atom that
-        // AVPlayer reads as the missing PQ signal. Safe to overwrite:
-        // P5 has no legal alternate color signaling.
-        let p5ColorOverride: MP4SegmentMuxer.ColorOverride? = (dvVariant == .profile5)
-            ? MP4SegmentMuxer.ColorOverride(
+        // here makes the muxer write a `colr nclx` atom that AVPlayer
+        // reads as the missing PQ signal.
+        //
+        // Primaries / transfer / matrix are spec-fixed for P5 (IPT-PQ-c2
+        // has no legal alternate), so forcing them is a repair, not an
+        // overwrite of valid data. Color range is the exception: P5 is
+        // typically limited but full-range P5 is legal, so a source that
+        // already signals a range keeps it (fill-the-gap, not stomp).
+        // The #19 repro has range unspecified, so it still resolves to
+        // limited; a properly-signaled full-range P5 is no longer forced
+        // down to limited (issue #20, DrHurt).
+        let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
+        if dvVariant == .profile5 {
+            let sourceRange = codecpar.pointee.color_range
+            p5ColorOverride = MP4SegmentMuxer.ColorOverride(
                 primaries: AVCOL_PRI_BT2020,
                 trc: AVCOL_TRC_SMPTE2084,
                 space: AVCOL_SPC_BT2020_NCL,
-                range: AVCOL_RANGE_MPEG
+                range: sourceRange == AVCOL_RANGE_UNSPECIFIED
+                    ? AVCOL_RANGE_MPEG
+                    : sourceRange
             )
-            : nil
+        } else {
+            p5ColorOverride = nil
+        }
         let videoConfig = HLSSegmentProducer.StreamConfig(
             codecpar: codecpar,
             timeBase: videoTimeBase,

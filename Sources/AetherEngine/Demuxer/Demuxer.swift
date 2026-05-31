@@ -7,6 +7,31 @@ import Libavutil
 /// imported into Swift, so we define it inline: FFERRTAG(0xF8,'E','O','F').
 private let AVERROR_EOF_VALUE: Int32 = -541478725
 
+/// Open-time tuning for the demuxer + its AVIO reader. `.playback` is
+/// the default everywhere; `.stillExtraction` switches AVIO to a
+/// random-access profile (no read-ahead prefetch, small seek chunk) and
+/// a minimal probe budget for fast single-keyframe fetches.
+struct DemuxerOpenProfile: Sendable {
+    var probesize: Int64
+    var maxAnalyzeDuration: Int64
+    var avioPrefetch: Bool
+    var avioChunkSize: Int
+
+    static let playback = DemuxerOpenProfile(
+        probesize: 50 * 1024 * 1024,
+        maxAnalyzeDuration: 60 * 1_000_000,
+        avioPrefetch: true,
+        avioChunkSize: 4 * 1024 * 1024
+    )
+
+    static let stillExtraction = DemuxerOpenProfile(
+        probesize: 2 * 1024 * 1024,
+        maxAnalyzeDuration: 2 * 1_000_000,
+        avioPrefetch: false,
+        avioChunkSize: 1 * 1024 * 1024
+    )
+}
+
 /// FFmpeg AVFormatContext wrapper. Opens a media URL, reads the stream
 /// info, and produces demuxed `AVPacket`s for the decoder.
 ///
@@ -28,6 +53,10 @@ public final class Demuxer: @unchecked Sendable {
     /// Retained while the format context is open for HTTP streams.
     private var avioReader: AVIOReader?
 
+    /// Profile supplied to the most recent `open` call. Governs probe
+    /// budget in `applyProbeBudget` and (in a later task) AVIO tuning.
+    private var openProfile: DemuxerOpenProfile = .playback
+
     /// Cumulative bytes fetched by the AVIO reader since the source
     /// was opened. Used by the engine's memory probe to compare
     /// network throughput against RSS growth. Zero for `file://`
@@ -42,7 +71,8 @@ public final class Demuxer: @unchecked Sendable {
     /// reader issues against `url` (HEAD probe + Range / streaming
     /// GETs). Ignored for `file://` URLs. Pass auth tokens or any
     /// other server-required headers here. Default empty.
-    func open(url: URL, extraHeaders: [String: String] = [:]) throws {
+    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback) throws {
+        self.openProfile = profile
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
@@ -118,8 +148,8 @@ public final class Demuxer: @unchecked Sendable {
     /// noticeably slowing playback start (LAN can move 50 MB in
     /// well under a second).
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
-        ctx.pointee.probesize = 50 * 1024 * 1024
-        ctx.pointee.max_analyze_duration = 60 * 1_000_000
+        ctx.pointee.probesize = openProfile.probesize
+        ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
     }
 
     /// Demuxer options passed to every `avformat_open_input` call.

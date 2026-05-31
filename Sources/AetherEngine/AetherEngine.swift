@@ -291,6 +291,8 @@ public final class AetherEngine: ObservableObject {
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
     /// background suspension.
+    // Internal getter (not public API): read by the same-module
+    // AetherEngine+FrameExtractor extension to vend a FrameExtractor.
     private(set) var loadedURL: URL?
 
     /// Seconds to ADD to AVPlayer's HLS clock to recover the source
@@ -327,6 +329,8 @@ public final class AetherEngine: ObservableObject {
     /// had loaded with `false`, which then routed HDR HEVC through the
     /// master playlist on a non-DV panel with Match Content off and
     /// surfaced "Öffnen fehlgeschlagen".
+    // Internal getter (not public API): read by the same-module
+    // AetherEngine+FrameExtractor extension to vend a FrameExtractor.
     private(set) var loadedOptions: LoadOptions = .init()
 
     /// In-flight sidecar subtitle decode. Cancelled on subtitle

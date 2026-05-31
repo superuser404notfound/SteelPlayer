@@ -5,8 +5,10 @@ extension AetherEngine {
     /// HTTP headers, or nil if nothing is loaded.
     ///
     /// The engine does NOT retain the returned extractor; the caller
-    /// owns its lifecycle (and should call `shutdown()` or release it
-    /// when done). Used for scrub-preview of the playing item.
+    /// owns its lifecycle. Call `await shutdown()` for prompt teardown
+    /// of the decode context; merely releasing the reference is also
+    /// safe but defers cleanup until the idle-close timer fires.
+    /// Used for scrub-preview of the playing item.
     /// Recents-style callers that need frames from arbitrary items
     /// should construct `FrameExtractor(url:httpHeaders:)` directly.
     public func makeFrameExtractor() -> FrameExtractor? {

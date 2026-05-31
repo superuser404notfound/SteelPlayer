@@ -142,6 +142,11 @@ final class AVIOReader: @unchecked Sendable {
 
     // MARK: - Seekable Mode (Range requests)
 
+    /// Per-instance seek chunk size. Default 4 MB (playback read-ahead);
+    /// the still-extraction profile passes a smaller value for
+    /// random-access single-keyframe fetches. (See the chunk-size leak
+    /// history notes below -- they apply to the 4 MB playback default.)
+    ///
     /// Settled chunk size: 4 MB.
     ///
     /// Field-validated 2026-05-22: paired with the delegate-based
@@ -235,7 +240,11 @@ final class AVIOReader: @unchecked Sendable {
     ///     would need re-validating that force-copy makes the pool
     ///     drop bytes promptly enough.
     ///   - Bounded pool of N reusable URLSessions, round-robin.
-    private static let chunkSize = 4 * 1024 * 1024  // 4 MB per chunk
+    private let chunkSize: Int
+    /// When false, no speculative next-chunk prefetch is issued (random
+    /// access: the next read almost always seeks elsewhere, so a prefetch
+    /// would be discarded and would compete with playback bandwidth).
+    private let prefetchEnabled: Bool
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
 
@@ -258,9 +267,11 @@ final class AVIOReader: @unchecked Sendable {
     private let streamLock = NSLock()
     private let streamDataReady = DispatchSemaphore(value: 0)
 
-    init(url: URL, extraHeaders: [String: String] = [:]) {
+    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true) {
         self.url = url
         self.extraHeaders = extraHeaders
+        self.chunkSize = chunkSize
+        self.prefetchEnabled = prefetchEnabled
     }
 
     /// Apply the caller-supplied extra headers to a request. Used by
@@ -307,10 +318,10 @@ final class AVIOReader: @unchecked Sendable {
             _ = streamDataReady.wait(timeout: .now() + .seconds(15))
         } else {
             // Seekable mode: pre-fill the first chunk with a Range request
-            if let data = fetchChunk(from: 0, size: Self.chunkSize) {
+            if let data = fetchChunk(from: 0, size: chunkSize) {
                 currentBuffer = data
                 currentOffset = 0
-                triggerPrefetch(from: Int64(data.count))
+                if prefetchEnabled { triggerPrefetch(from: Int64(data.count)) }
             }
         }
     }
@@ -403,7 +414,7 @@ final class AVIOReader: @unchecked Sendable {
 
                 let consumed = Double(position - currentOffset) / Double(currentBuffer.count)
                 let nextPrefetchOffset = currentOffset + Int64(currentBuffer.count)
-                let needsPrefetch = consumed > 0.5 && !isPrefetching && prefetchBuffer == nil
+                let needsPrefetch = prefetchEnabled && consumed > 0.5 && !isPrefetching && prefetchBuffer == nil
                 bufferLock.unlock()
 
                 if needsPrefetch {
@@ -436,16 +447,16 @@ final class AVIOReader: @unchecked Sendable {
                     bufferLock.unlock()
                 }
 
-                let chunkSize: Int
+                let fetchSize: Int
                 if fileSize > 0 {
-                    chunkSize = min(Self.chunkSize, Int(fileSize - position))
+                    fetchSize = min(chunkSize, Int(fileSize - position))
                 } else {
-                    chunkSize = Self.chunkSize
+                    fetchSize = chunkSize
                 }
 
-                if chunkSize <= 0 { break }
+                if fetchSize <= 0 { break }
 
-                guard let data = fetchChunk(from: position, size: chunkSize) else {
+                guard let data = fetchChunk(from: position, size: fetchSize) else {
                     break
                 }
 
@@ -563,6 +574,7 @@ final class AVIOReader: @unchecked Sendable {
     // MARK: - Prefetch (background, seekable mode only)
 
     private func triggerPrefetch(from offset: Int64) {
+        guard prefetchEnabled else { return }
         if fileSize > 0 && offset >= fileSize { return }
 
         bufferLock.lock()
@@ -591,9 +603,9 @@ final class AVIOReader: @unchecked Sendable {
 
             let size: Int
             if self.fileSize > 0 {
-                size = min(Self.chunkSize, Int(self.fileSize - offset))
+                size = min(self.chunkSize, Int(self.fileSize - offset))
             } else {
-                size = Self.chunkSize
+                size = self.chunkSize
             }
 
             let data = size > 0 ? self.fetchChunk(from: offset, size: size) : nil

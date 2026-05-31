@@ -108,7 +108,12 @@ public final class Demuxer: @unchecked Sendable {
     /// Open an HTTP(S) URL via custom AVIO context + URLSession.
     private func openHTTP(url: URL, extraHeaders: [String: String]) throws {
         // 1. Create and open the AVIO reader (performs HEAD request)
-        let reader = AVIOReader(url: url, extraHeaders: extraHeaders)
+        let reader = AVIOReader(
+            url: url,
+            extraHeaders: extraHeaders,
+            chunkSize: openProfile.avioChunkSize,
+            prefetchEnabled: openProfile.avioPrefetch
+        )
         try reader.open()
         avioReader = reader
 

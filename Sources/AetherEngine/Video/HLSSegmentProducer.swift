@@ -1102,23 +1102,67 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                     if firstActualAudioDts == Int64.min {
                         firstActualAudioDts = packet.pointee.dts
-                        audioShiftPts = firstActualAudioDts - desiredFirstAudioTfdtPts
-                        // Gap between video's first kept dts (rescaled
-                        // into the source audio TB) and the audio
-                        // packet we just accepted as the gate opener.
-                        // A non-zero gap means the audio content
-                        // playing alongside seg-N's first video frame
-                        // actually corresponds to a slightly different
-                        // source-time, which surfaces as A/V drift on
-                        // restart sessions (Vincent's scrub-back-to-
-                        // start desync repro). Within ~25 ms is one
-                        // AAC frame and not perceptible; anything
-                        // larger gets a WARNING so it's grep-able in
-                        // a support log.
-                        let gapInAudioTb = restartTargetAudioDts == Int64.min
-                            ? 0
-                            : firstActualAudioDts - restartTargetAudioDts
                         let audioTb = audioConfig?.sourceTimeBase ?? AVRational(num: 1, den: 1000)
+                        if restartTargetVideoDts == Int64.min {
+                            // Head-of-stream. The audio track's first
+                            // packet carries its intrinsic offset from
+                            // video: audio frame boundaries almost never
+                            // line up with video frame 0, so the first
+                            // full audio frame routinely lands tens to
+                            // hundreds of ms into the source (Cars: EAC3
+                            // first frame at +256 ms). Snapping that packet
+                            // onto the video's tfdt (desired = 0, the
+                            // playlist origin) — as the restart branch
+                            // does — would subtract the whole offset from
+                            // EVERY audio packet, pulling the entire track
+                            // that far ahead of the picture for the rest of
+                            // the session (audio leads video). Instead the
+                            // audio inherits the video's origin shift, so
+                            // both streams undergo ONE shared transform and
+                            // their true source-time relationship is kept
+                            // by construction. A global container start
+                            // (video itself starting late) is still removed,
+                            // because videoShiftPts already captures it; only
+                            // the audio-minus-video offset survives, which is
+                            // exactly the part that must survive to stay in
+                            // sync. The audio fragment's tfdt then starts a
+                            // little after the video's, which fmp4 / AVPlayer
+                            // represent natively (audio is simply silent for
+                            // the leading offset). videoShiftPts is already
+                            // set here: the video gate always opens first.
+                            audioShiftPts = av_rescale_q(
+                                videoShiftPts,
+                                sourceVideoTimeBase,
+                                audioTb
+                            )
+                        } else {
+                            // Restart session: keep the gate-on-video snap.
+                            // The first audio packet is aligned to the video
+                            // keyframe's tfdt so both fragments share a
+                            // baseMediaDecodeTime after a mid-stream seek.
+                            // The residual offset removed here is sub-frame
+                            // (the demuxer is reading interleaved packets
+                            // around the seek point, so the nearest audio
+                            // packet sits within one frame of the keyframe),
+                            // hence imperceptible. This is part of the
+                            // delicate HEVC-resume alignment stack; do NOT
+                            // fold it into the head-of-stream branch.
+                            audioShiftPts = firstActualAudioDts - desiredFirstAudioTfdtPts
+                        }
+                        // Diagnostic A/V gap. On restart this is the offset
+                        // the snap removes (first audio packet vs. the
+                        // rescaled video keyframe dts). At head-of-stream we
+                        // PRESERVE the intrinsic offset rather than removing
+                        // it, so no misalignment is introduced and the
+                        // reported gap is 0.
+                        let gapInAudioTb: Int64
+                        if restartTargetVideoDts == Int64.min {
+                            gapInAudioTb = 0
+                        } else {
+                            gapInAudioTb = restartTargetAudioDts == Int64.min
+                                ? 0
+                                : firstActualAudioDts - restartTargetAudioDts
+                        }
                         let gapMs = audioTb.den > 0
                             ? Double(gapInAudioTb) * Double(audioTb.num) * 1000.0 / Double(audioTb.den)
                             : 0

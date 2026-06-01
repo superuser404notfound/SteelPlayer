@@ -1,0 +1,54 @@
+name: "Used by submission"
+description: "Ship an app built on AetherEngine? Submit it for the README's Used by list."
+title: "[Used by] <your app name>"
+labels: ["used-by-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for building on AetherEngine. Fill this in and a maintainer will review it.
+        Once approved, your app is added to the Used by list in the README automatically via a pull request.
+  - type: input
+    id: app-name
+    attributes:
+      label: App name
+      description: "The display name, exactly as it should appear in the list."
+      placeholder: "Sodalite"
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Repository or website URL
+      description: "Where the link should point (GitHub repo, App Store page, or product site)."
+      placeholder: "https://github.com/you/your-app"
+    validations:
+      required: true
+  - type: input
+    id: description
+    attributes:
+      label: One-line description
+      description: "Shown after the colon. Keep it to a single short sentence, no trailing period needed."
+      placeholder: "native Jellyfin client for Apple TV"
+    validations:
+      required: true
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Platforms
+      options:
+        - iOS
+        - tvOS
+        - macOS
+        - Multiple
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: "This app actually ships AetherEngine as a dependency."
+          required: true
+        - label: "The name, URL, and description above are correct and ready to publish."
+          required: true

@@ -133,6 +133,15 @@ Two complementary samples ship in `Examples/`:
 - [`MinimalPlayer/`](Examples/MinimalPlayer/MinimalPlayerApp.swift) — 90-line SwiftUI drop-in for developers integrating the engine. Copy the file into a new Xcode tvOS / iOS / macOS app, point at a URL, run.
 - [`DemoPlayerMac/`](Examples/DemoPlayerMac/README.md) — standalone macOS app for testers wanting to exercise the engine against their own media without writing host code. Drop a file onto the window, it plays. Pre-built universal `.dmg` is attached to every [GitHub Release](https://github.com/superuser404notfound/AetherEngine/releases/latest) (notarized, runs cleanly through Gatekeeper).
 
+## Used by
+
+<!-- used-by:start -->
+- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
+- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
+<!-- used-by:end -->
+
+Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed.
+
 ## Host setup on tvOS
 
 For HDR / Dolby Vision sources to play reliably on tvOS 26.5+, the
@@ -465,10 +474,6 @@ Pin to `.upToNextMinor(from: "2.0.0")` for stricter teams that prefer to opt int
 | macOS | 14.0 |
 | Swift | 6.0 |
 | Xcode | 16.0 |
-
-## Used by
-
-- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
 
 ## Support
 

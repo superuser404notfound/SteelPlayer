@@ -1,0 +1,95 @@
+name: Add to Used by
+
+# When a maintainer adds the "approved" label to a "used-by-submission" issue,
+# parse the issue form, insert the entry into the README's Used by list (between
+# the <!-- used-by:start --> / <!-- used-by:end --> markers), and open a PR.
+# Merging the PR is the final approval gate; this workflow never pushes to main.
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  add-entry:
+    if: >
+      github.event.label.name == 'approved' &&
+      contains(github.event.issue.labels.*.name, 'used-by-submission')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse issue form
+        id: parse
+        uses: stefanbuck/github-issue-parser@v3
+
+      - name: Build entry and insert into README
+        id: build
+        env:
+          # Pass parsed fields through env, never interpolate issue content into the script body.
+          ISSUE_JSON: ${{ steps.parse.outputs.jsonString }}
+        run: |
+          set -euo pipefail
+
+          name=$(printf '%s' "$ISSUE_JSON" | jq -r '.["app-name"] // empty' | head -n1)
+          url=$(printf '%s' "$ISSUE_JSON" | jq -r '.url // empty' | head -n1)
+          desc=$(printf '%s' "$ISSUE_JSON" | jq -r '.description // empty' | head -n1)
+
+          if [ -z "$name" ] || [ -z "$url" ] || [ -z "$desc" ]; then
+            echo "Missing a required field (name/url/description). Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Normalise: trim whitespace, collapse to one trailing period.
+          name=$(printf '%s' "$name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          url=$(printf '%s'  "$url"  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          desc=$(printf '%s' "$desc" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\.*$//')
+
+          # Dedupe: bail out if the URL is already listed between the markers.
+          block=$(sed -n '/<!-- used-by:start -->/,/<!-- used-by:end -->/p' README.md)
+          if printf '%s' "$block" | grep -qF "$url"; then
+            echo "$url is already in the Used by list. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          entry="- [$name]($url): $desc."
+
+          # Insert the entry on the line directly above the end marker.
+          tmp=$(mktemp)
+          ENTRY="$entry" awk '
+            /<!-- used-by:end -->/ { print ENVIRON["ENTRY"] }
+            { print }
+          ' README.md > "$tmp"
+          mv "$tmp" README.md
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          {
+            echo "Added **$name** to the Used by list:"
+            echo
+            echo '```'
+            echo "$entry"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open pull request
+        if: steps.build.outputs.skip == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: used-by/issue-${{ github.event.issue.number }}
+          commit-message: "docs(used-by): add ${{ steps.build.outputs.name }}"
+          title: "docs(used-by): add ${{ steps.build.outputs.name }}"
+          body: |
+            Adds **${{ steps.build.outputs.name }}** to the Used by list.
+
+            Approved submission from #${{ github.event.issue.number }}. Merging this PR publishes the entry.
+
+            Closes #${{ github.event.issue.number }}
+          labels: used-by-submission
+          delete-branch: true

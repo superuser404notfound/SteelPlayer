@@ -12,6 +12,14 @@ the public-API contract.
 
 _Nothing yet._
 
+## [2.1.3] — 2026-06-01
+
+Playback fix. Transport state sync. No public API change, existing 2.1.x callers are unaffected.
+
+- **Rapid play/pause presses no longer get swallowed.** On the native (AVPlayer) path the engine never derived its `state` from the player. When something other than `engine.play()` / `pause()` drove the AVPlayer (a host that keeps AVKit's transport bar active for Control Center skip routing, Control Center itself, or the hardware play/pause button AVKit handles internally), the engine's `state` went stale and the next `togglePlayPause()` resolved to the action already in effect, a visible no-op. `NativeAVPlayerHost` now publishes `timeControlStatus` and the engine reconciles `state` (playing / paused) from it, guarded to the steady transport states so loading, seeking, error and idle are never clobbered (`waitingToPlayAtSpecifiedRate` maps to playing so the icon does not flicker on a rebuffer). `togglePlayPause()` additionally decides from the live player rather than the published state, closing the async gap during fast presses.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/2.1.3))
+
 ## [2.1.2] — 2026-06-01
 
 Playback fix. Head-of-stream A/V sync. No public API change, existing 2.1.x callers are unaffected.

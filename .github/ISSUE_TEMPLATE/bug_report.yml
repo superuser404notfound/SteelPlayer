@@ -34,8 +34,8 @@ body:
     id: engine-version
     attributes:
       label: AetherEngine version or commit SHA
-      description: A tag (e.g. `2.1.2`) or the pinned commit from your Package.resolved
-      placeholder: "2.1.2 / 72d751d"
+      description: A tag (e.g. `2.1.3`) or the pinned commit from your Package.resolved
+      placeholder: "2.1.3 / 26c46f9"
     validations:
       required: true
 
